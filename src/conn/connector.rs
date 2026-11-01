@@ -21,6 +21,8 @@ use super::{
     TlsConn, TlsInfoFactory, Unnameable, descriptor::ConnectionDescriptor, http::HttpConnect,
     net::TcpConnector, proxy, verbose::Verbose,
 };
+#[cfg(feature = "tokio-rt")]
+use crate::tls::conn::Preconnected;
 use crate::{
     dns::DynResolver,
     error::{ProxyConnect, TimedOut, map_timeout_to_connector_error},
@@ -128,26 +130,33 @@ impl ConnectorBuilder {
         self
     }
 
-    /// Build a [`Connector`] with the provided layers.
+    /// Build a [`Connector`] with the provided layers, and the [`TlsConnector`] it opens
+    /// connections with: `tls_connector`, else one built from `tls_options`.
     pub fn build(
         self,
         tls_options: Option<TlsOptions>,
+        tls_connector: Option<TlsConnector>,
         layers: Vec<BoxedConnectorLayer>,
-    ) -> crate::Result<Connector> {
+    ) -> crate::Result<(Connector, TlsConnector)> {
+        let tls = match tls_connector {
+            Some(tls) => tls,
+            None => self
+                .builder
+                .build(tls_options.map(Cow::Owned).unwrap_or_default())?,
+        };
         let mut service = ConnectorService {
             config: self.config,
             #[cfg(feature = "socks")]
             resolver: self.resolver.clone(),
             http: self.http,
-            tls: self
-                .builder
-                .build(tls_options.map(Cow::Owned).unwrap_or_default())?,
+            tls,
             builder: Arc::new(self.builder),
         };
+        let tls = service.tls.clone();
 
         // we have no user-provided layers, only use concrete types
         if layers.is_empty() {
-            return Ok(Connector::Simple(service));
+            return Ok((Connector::Simple(service), tls));
         }
 
         // user-provided layers exist, the timeout will be applied as an additional layer.
@@ -176,7 +185,10 @@ impl ConnectorBuilder {
                     .service(service)
                     .map_err(map_timeout_to_connector_error);
 
-                Ok(Connector::WithLayers(BoxCloneSyncService::new(service)))
+                Ok((
+                    Connector::WithLayers(BoxCloneSyncService::new(service)),
+                    tls,
+                ))
             }
             None => {
                 // no timeout, but still map err
@@ -186,7 +198,10 @@ impl ConnectorBuilder {
                     .service(service)
                     .map_err(map_timeout_to_connector_error);
 
-                Ok(Connector::WithLayers(BoxCloneSyncService::new(service)))
+                Ok((
+                    Connector::WithLayers(BoxCloneSyncService::new(service)),
+                    tls,
+                ))
             }
         }
     }
@@ -450,7 +465,7 @@ impl ConnectorService {
                     return self.tunnel_conn_from_stream(io);
                 }
 
-                *descriptor.uri_mut() = proxy_uri;
+                descriptor.set_uri(proxy_uri);
                 self.connect_auto_proxy(descriptor, proxy)
                     .await
                     .map_err(ProxyConnect)
@@ -498,12 +513,61 @@ impl ConnectorService {
     }
 
     async fn connect_auto(self, req: ConnectionDescriptor) -> Result<Conn, BoxError> {
+        // A TCP connection offered to open over; a retry after it was taken connects anew.
+        #[cfg(feature = "tokio-rt")]
+        let mut offered_tcp = None;
+        #[cfg(feature = "tokio-rt")]
+        match req.preconnected() {
+            Some(Preconnected::Adopt(offer)) => {
+                let mut stream = offer
+                    .take()
+                    .ok_or("the adopted connection was already used")?;
+                let tls = match req.tls_options() {
+                    Some(opts) => self.builder.build(Cow::Borrowed(opts))?,
+                    None => self.tls.clone(),
+                };
+                if !(req.uri().is_https() && tls.opened_for(&stream, &req)?) {
+                    return Err("the adopted connection is not one this request would open".into());
+                }
+                // An HTTP/2 peer speaks first (its SETTINGS), which the connection reads.
+                let h2 = stream.stream.ssl().selected_alpn_protocol() == Some(b"h2");
+                if !h2 && !stream.idle() {
+                    return Err("the adopted connection is closed or has unread data".into());
+                }
+                debug!("adopting a connection: {:?}", req.uri());
+                return Ok(Conn {
+                    stream: self.config.verbose.wrap(TlsConn {
+                        stream: stream.stream,
+                    }),
+                    tls_info: self.config.tls_info,
+                    proxy: None,
+                });
+            }
+            Some(Preconnected::Over(offer)) => offered_tcp = offer.take(),
+            None => {}
+        }
+
         debug!("starting new connection: {:?}", req.uri());
 
         let timeout = self.config.timeout;
 
         // Determine if a proxy should be used for this request.
         let fut = async {
+            #[cfg(feature = "tokio-rt")]
+            if let Some(stream) = offered_tcp {
+                debug!(
+                    "opening the connection over an offered one: {:?}",
+                    req.uri()
+                );
+                let is_https = req.uri().is_https();
+                let mut connector = self.build_https_connector(is_https, &req)?;
+                let io = connector.call(EstablishedConn::new(stream, req)).await?;
+                if is_https && !self.config.nodelay {
+                    io.as_ref().set_nodelay(false)?;
+                }
+                return self.tunnel_conn_from_stream(io);
+            }
+
             let intercepted = req
                 .proxy()
                 .and_then(|prox| prox.intercept(req.uri()))

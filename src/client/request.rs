@@ -8,7 +8,7 @@ use std::{
 
 #[cfg(any(feature = "form", feature = "json", feature = "multipart"))]
 use http::header::CONTENT_TYPE;
-use http::{Extensions, Uri, Version};
+use http::{Extensions, Uri, Version, uri::Authority};
 #[cfg(any(feature = "query", feature = "form", feature = "json"))]
 use serde::Serialize;
 #[cfg(feature = "multipart")]
@@ -31,11 +31,16 @@ use super::{
 };
 #[cfg(feature = "cookies")]
 use crate::cookie::{CookieStore, IntoCookieStore};
+#[cfg(feature = "tokio-rt")]
+use crate::tls::{
+    TlsStream,
+    conn::{Offer, Preconnected},
+};
 use crate::{
     Error, Method, Proxy,
     config::{RequestConfig, RequestConfigValue},
     ext::UriExt,
-    group::Group,
+    group::{ConnectionScope, Group},
     header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue, OrigHeaderMap},
     redirect,
 };
@@ -569,6 +574,16 @@ impl RequestBuilder {
         self
     }
 
+    /// Makes a connection [`Self::tls_connect`] opens wait on `gate` for the application
+    /// settings (ALPS) it sends, and for whether it trusts a certificate failing
+    /// verification (see [`AlpsGate`](crate::tls::AlpsGate)).
+    pub fn alps_gate(mut self, gate: crate::tls::AlpsGate) -> RequestBuilder {
+        if let Ok(ref mut req) = self.request {
+            req.extensions_mut().insert(gate);
+        }
+        self
+    }
+
     /// Set the redirect policy for this request.
     pub fn redirect(mut self, policy: redirect::Policy) -> RequestBuilder {
         if let Ok(ref mut req) = self.request {
@@ -789,6 +804,150 @@ impl RequestBuilder {
                 .get_or_insert_default()
                 .group
                 .request(group);
+        }
+        self
+    }
+
+    /// Sets the name the TLS handshake announces (SNI) and verifies the server certificate
+    /// against, instead of the URI host; `None` announces no name and verifies the URI host
+    /// (or [`tls_verify_name`](Self::tls_verify_name)). Connections announcing different
+    /// names are never shared.
+    pub fn tls_server_name(mut self, name: Option<&str>) -> RequestBuilder {
+        if let Ok(ref mut req) = self.request {
+            req.config_mut::<RequestOptions>()
+                .get_or_insert_default()
+                .tls_server_name = Some(name.map(Box::from));
+        }
+        self
+    }
+
+    /// Sets the name the TLS handshake verifies the server certificate against, instead of
+    /// the URI host, when it announces no name ([`tls_server_name(None)`](Self::tls_server_name)),
+    /// still announcing none. Connections verifying different names are never shared. It
+    /// has no effect otherwise.
+    pub fn tls_verify_name(mut self, name: &str) -> RequestBuilder {
+        if let Ok(ref mut req) = self.request {
+            req.config_mut::<RequestOptions>()
+                .get_or_insert_default()
+                .tls_verify_name = Some(Box::from(name));
+        }
+        self
+    }
+
+    /// Completes the TLS handshake of a new connection this request opens even when the
+    /// server certificate fails verification (an untrusted issuer, expiry, a name
+    /// mismatch, …), provided the SHA-256 of the leaf certificate's DER is `leaf_sha256`;
+    /// another leaf fails it as before. Connections accepting a certificate are shared only
+    /// with requests accepting the same one.
+    pub fn accept_certificate(mut self, leaf_sha256: [u8; 32]) -> RequestBuilder {
+        if let Ok(ref mut req) = self.request {
+            req.config_mut::<RequestOptions>()
+                .get_or_insert_default()
+                .accepted_certificate = Some(leaf_sha256);
+        }
+        self
+    }
+
+    /// Accepts, in the TLS 1.2 DHE handshake of a new connection this request opens, a
+    /// Diffie-Hellman group of at least `bits` bits instead of 2048 (never one below 512).
+    /// Connections accepting a smaller group serve only requests accepting the same; a
+    /// resumed session keeps the group of the handshake that established it.
+    pub fn min_dhe_bits(mut self, bits: u16) -> RequestBuilder {
+        if let Ok(ref mut req) = self.request {
+            req.config_mut::<RequestOptions>()
+                .get_or_insert_default()
+                .min_dhe_bits = Some(bits);
+        }
+        self
+    }
+
+    /// Opens this request's connection to `authority` instead of the URI's (as curl's
+    /// `--connect-to`): DNS, any proxy tunnel, and the pool key follow `authority`, while
+    /// TLS still names the URI host (or [`tls_server_name`](Self::tls_server_name)) and
+    /// the request keeps its URI. Requests naming different hosts thus share a connection
+    /// opened to the same authority under the same TLS name.
+    pub fn connect_to<A>(mut self, authority: A) -> RequestBuilder
+    where
+        Authority: TryFrom<A>,
+        <Authority as TryFrom<A>>::Error: Into<http::Error>,
+    {
+        if let Ok(ref mut req) = self.request {
+            match Authority::try_from(authority) {
+                Ok(authority) => {
+                    req.config_mut::<RequestOptions>()
+                        .get_or_insert_default()
+                        .connect_to = Some(authority);
+                }
+                Err(err) => self.request = Err(Error::builder(err.into())),
+            }
+        }
+        self
+    }
+
+    /// Opens a TLS connection over `io` as this request's own connection would open, with
+    /// the ClientHello, trust, client identity and TLS sessions of that connection, but
+    /// offering no ALPN. It is bounded by no timeout of the client's, and a failed
+    /// handshake's error has a [`HandshakeFailure`](crate::tls::HandshakeFailure) source.
+    /// The pool can adopt the connection (see [`RequestBuilder::adopt`]).
+    #[cfg(feature = "tokio-rt")]
+    pub async fn tls_connect<IO>(self, io: IO) -> crate::Result<TlsStream<IO>>
+    where
+        IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        self.client.tls_connect(self.request?, io, false).await
+    }
+
+    /// Like [`RequestBuilder::tls_connect`], but offering the ALPN protocols this request's
+    /// own connection would.
+    #[cfg(feature = "tokio-rt")]
+    pub async fn tls_connect_with_alpn<IO>(self, io: IO) -> crate::Result<TlsStream<IO>>
+    where
+        IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        self.client.tls_connect(self.request?, io, true).await
+    }
+
+    /// Adopts `stream`, a connection opened with [`RequestBuilder::tls_connect`] or
+    /// [`RequestBuilder::tls_connect_with_alpn`] to where this request's own connection
+    /// would go (the same address, through the same proxy), into the pool as an idle
+    /// connection for the requests this one would share a connection with, instead of
+    /// sending this request: an HTTP/2 one, set up with this request's HTTP/2 options, when
+    /// its ALPN chose `h2`, else an HTTP/1 one. It fails, closing `stream`, unless this
+    /// client's TLS connector opened it verifying and announcing the name this request's
+    /// connection would, it speaks a version this request allows, and, for HTTP/1, the peer
+    /// has neither closed it nor sent anything.
+    #[cfg(feature = "tokio-rt")]
+    pub async fn adopt(mut self, stream: TlsStream<tokio::net::TcpStream>) -> crate::Result<()> {
+        if let Ok(ref mut req) = self.request {
+            req.config_mut::<RequestOptions>()
+                .get_or_insert_default()
+                .preconnected = Some(Preconnected::Adopt(Offer::new(stream)));
+        }
+        self.client.adopt(self.request?).await
+    }
+
+    /// Opens this request's connection, should it need a new one, over `stream`, a TCP
+    /// connection already open to where that connection would go (the same address,
+    /// through the same proxy), instead of connecting; TLS then runs over it as over any
+    /// new connection. An idle pooled connection still serves the request first, and
+    /// `stream` then closes unused.
+    #[cfg(feature = "tokio-rt")]
+    pub fn connect_over(mut self, stream: tokio::net::TcpStream) -> RequestBuilder {
+        if let Ok(ref mut req) = self.request {
+            req.config_mut::<RequestOptions>()
+                .get_or_insert_default()
+                .preconnected = Some(Preconnected::Over(Offer::new(stream)));
+        }
+        self
+    }
+
+    /// Confines this request's connection to `scope`: it reuses only connections opened
+    /// for requests of the same scope, and those close once the scope is dropped.
+    pub fn connection_scope(mut self, scope: &ConnectionScope) -> RequestBuilder {
+        if let Ok(ref mut req) = self.request {
+            req.config_mut::<RequestOptions>()
+                .get_or_insert_default()
+                .scope = Some(scope.handle());
         }
         self
     }

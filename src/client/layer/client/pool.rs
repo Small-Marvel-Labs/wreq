@@ -39,6 +39,10 @@ pub trait Poolable: Unpin + Send + Sized + 'static {
     /// Allows for HTTP/2 to return a shared reservation.
     fn reserve(self) -> Reservation<Self>;
     fn can_share(&self) -> bool;
+    /// Whether it stays in the pool idle however long, rather than for the idle timeout.
+    fn outlives_idle_timeout(&self) -> bool {
+        false
+    }
 }
 
 pub trait Key: Eq + Hash + Clone + Debug + Unpin + Send + 'static {}
@@ -151,6 +155,27 @@ impl<T: Poolable, K: Key> Pool<T, K> {
             pool: self.clone(),
             waiter: None,
         }
+    }
+
+    /// Takes an idle connection under `key` that can't be shared (HTTP/1) right away,
+    /// leaving any shared one in place.
+    pub fn checkout_unshared(&self, key: &K) -> Option<Pooled<T, K>> {
+        let value = {
+            let mut inner = self.inner.as_ref()?.lock();
+            let expiration = Expiration::new(inner.timeout);
+            let now = inner.now();
+            let list = inner.idle.get_mut(key)?;
+            list.retain(|entry| entry.value.is_open() && !expiration.expires(entry, now));
+            let value = list
+                .iter()
+                .rposition(|entry| !entry.value.can_share())
+                .map(|index| list.remove(index).value);
+            if list.is_empty() {
+                inner.idle.pop(key);
+            }
+            value
+        }?;
+        Some(self.reuse(key, value))
     }
 
     /// Ensure that there is only ever 1 connecting task for HTTP/2
@@ -270,7 +295,7 @@ impl<'a, T: Poolable + 'a, K: Debug> IdlePopper<'a, T, K> {
             //
             // In that case, we could just break out of the loop and drop the
             // whole list...
-            if expiration.expires(entry.idle_at, now) {
+            if expiration.expires(&entry, now) {
                 trace!("removing expired connection for {:?}", self.key);
                 continue;
             }
@@ -458,7 +483,9 @@ impl<T: Poolable, K: Key> PoolInner<T, K> {
                 }
 
                 // Avoid `Instant::sub` to avoid issues like rust-lang/rust#86470.
-                if now.saturating_duration_since(entry.idle_at) > dur {
+                if !entry.value.outlives_idle_timeout()
+                    && now.saturating_duration_since(entry.idle_at) > dur
+                {
                     trace!("idle interval evicting expired for {:?}", key);
                     return false;
                 }
@@ -734,11 +761,13 @@ impl Expiration {
         Expiration(dur)
     }
 
-    fn expires(&self, instant: Instant, now: Instant) -> bool {
+    fn expires<T: Poolable>(&self, entry: &Idle<T>, now: Instant) -> bool {
         match self.0 {
             // Avoid `Instant::elapsed` to avoid issues like rust-lang/rust#86470.
-            Some(timeout) => now.saturating_duration_since(instant) > timeout,
-            None => false,
+            Some(timeout) if !entry.value.outlives_idle_timeout() => {
+                now.saturating_duration_since(entry.idle_at) > timeout
+            }
+            _ => false,
         }
     }
 }

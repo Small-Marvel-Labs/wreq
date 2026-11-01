@@ -4,13 +4,21 @@ use std::{
 };
 
 use futures_util::future::{self, Either, Ready};
-use http::{HeaderMap, Request, Response, Version};
+use http::{HeaderMap, Request, Response, Version, uri::Authority};
 use tower::{Layer, Service};
 use wreq_proto::{http1::Http1Options, http2::Http2Options};
 
+#[cfg(feature = "tokio-rt")]
+use crate::tls::conn::Preconnected;
 use crate::{
-    Error, config::RequestConfig, conn::net::SocketBindOptions, ext::UriExt, group::Group,
-    header::OrigHeaderMap, proxy::Matcher, tls::TlsOptions,
+    Error,
+    config::RequestConfig,
+    conn::net::SocketBindOptions,
+    ext::UriExt,
+    group::{Group, ScopeRef},
+    header::OrigHeaderMap,
+    proxy::Matcher,
+    tls::TlsOptions,
 };
 
 /// A marker type for the default headers configuration value.
@@ -29,6 +37,14 @@ pub(crate) struct RequestOptions {
     pub http1_options: Option<Http1Options>,
     pub http2_options: Option<Http2Options>,
     pub socket_bind_options: Option<SocketBindOptions>,
+    pub tls_server_name: Option<Option<Box<str>>>,
+    pub tls_verify_name: Option<Box<str>>,
+    pub accepted_certificate: Option<[u8; 32]>,
+    pub min_dhe_bits: Option<u16>,
+    pub scope: Option<ScopeRef>,
+    pub connect_to: Option<Authority>,
+    #[cfg(feature = "tokio-rt")]
+    pub preconnected: Option<Preconnected>,
 }
 
 /// Configuration for the [`ConfigService`].

@@ -95,12 +95,13 @@ http-body = "1.0.1"
 http-body-util = "0.1.4"
 percent-encoding = "2.3.2"
 pin-project-lite = "0.2.17"
-futures-util = { version = "0.3.33", default-features = false }
+futures-util = { version = "0.3.33", default-features = false, features = ["std"] }
 socket2 = { version = "0.6.3", features = ["all"] }
 ipnet = "2.12.0"
 lru = "0.18.0"
 btls = "0.5.6"
 btls-sys = "0.5.6"
+foreign-types = "0.5"
 tokio-btls = "0.5.6"
 tokio = { version = "1.52.3", default-features = false }
 compio = { version = "0.19.0-rc.1", features = ["io", "io-compat"], optional = true }
@@ -203,6 +204,17 @@ sysinfo = { version = "0.39.1", default-features = false, features = ["system"] 
 criterion = { version = "0.8.2", features = ["async_tokio"] }
 reqwest = { version = "0.13.3", default-features = false, features = ["rustls", "stream", "http2"] }
 cyper = { version = "0.9.0",  default-features = false, features = ["rustls", "stream"] }
+
+# The btls fork carrying the ClientHello controls this fork's TLS options use, and the
+# fatal alerts its connections send.
+[patch.crates-io]
+btls = { git = "https://github.com/Small-Marvel-Labs/btls", rev = "b274f23f8a99b59e20e8e1041c9a3509680a03ce" }
+btls-sys = { git = "https://github.com/Small-Marvel-Labs/btls", rev = "b274f23f8a99b59e20e8e1041c9a3509680a03ce" }
+tokio-btls = { git = "https://github.com/Small-Marvel-Labs/btls", rev = "b274f23f8a99b59e20e8e1041c9a3509680a03ce" }
+# The wreq-proto and http2 forks carrying the HTTP/2 controls (`Control`, frame logs and
+# relays) this fork's connection scopes use.
+http2 = { git = "https://github.com/Small-Marvel-Labs/http2", branch = "wiremason" }
+wreq-proto = { git = "https://github.com/Small-Marvel-Labs/wreq-proto", branch = "wiremason" }
 
 [profile.release]
 codegen-units = 1

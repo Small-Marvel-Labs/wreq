@@ -15,6 +15,10 @@ use std::borrow::Cow;
 pub use btls::ssl::{ExtensionType, KeyShare};
 use bytes::{BufMut, Bytes, BytesMut};
 use compress::CertificateCompressor;
+pub use conn::{
+    HandshakeFailure, QuicServerFlight, QuicSsl, QuicTlsConnector, QuicTlsConnectorBuilder,
+    TlsStream,
+};
 
 /// Http extension carrying extra TLS layer information.
 /// Made available to clients on responses when `tls_info` is set.
@@ -22,9 +26,359 @@ use compress::CertificateCompressor;
 pub struct TlsInfo {
     pub(crate) peer_certificate: Option<Bytes>,
     pub(crate) peer_certificate_chain: Option<Vec<Bytes>>,
+    pub(crate) version: &'static str,
+    pub(crate) cipher: Option<&'static str>,
+    pub(crate) alpn_protocol: Option<Bytes>,
+    pub(crate) connection: std::sync::Arc<TlsConnectionUse>,
+    pub(crate) client_hello: Option<Bytes>,
+    pub(crate) server_flight: Option<conn::SharedFlight>,
+    pub(crate) group: Option<u16>,
+    pub(crate) hello_retry_request: bool,
+    pub(crate) aia_fetches: Vec<trust::AiaFetch>,
+    pub(crate) verified_path: Option<Vec<Bytes>>,
+    pub(crate) peer_ocsp: Option<Bytes>,
+    pub(crate) dhe_bits: Option<u16>,
+    pub(crate) verify_error: Option<(i32, &'static str)>,
+}
+
+/// The raw handshake messages an origin sent this connection (its server flight), in the
+/// order received, captured by the connection's BoringSSL message callback (see
+/// `crate::tls::conn`). Each entry is one handshake message: its one-byte type, its
+/// three-byte length, and its body — without the record-layer header.
+///
+/// A downstream TLS server can parse these to reproduce the origin's handshake to the
+/// real client: the ServerHello (its chosen version, cipher, group and extension order),
+/// a HelloRetryRequest (a ServerHello whose random is the well-known HRR marker), the
+/// EncryptedExtensions (ALPN, ALPS, and their order), the Certificate message, the
+/// CertificateVerify (its signature algorithm), NewSessionTicket(s) (their count,
+/// lifetime and ticket size), and for TLS 1.2 the ServerKeyExchange and
+/// CertificateRequest.
+///
+/// Tickets arrive after the handshake completes, so the flight grows as the connection is
+/// read; take a snapshot once the response head is in hand for the tickets sent so far.
+/// Past the server's Finished, it keeps only its first 16 NewSessionTickets and its first
+/// CertificateRequest (post-handshake authentication, or a renegotiation's).
+#[derive(Debug, Clone, Default)]
+pub struct ServerFlight {
+    messages: Vec<Bytes>,
+}
+
+/// Lets a client connection's handshake wait, once the server's flight is in and an
+/// [`AiaCache`](trust::AiaCache) verified its certificate (see
+/// [`ClientBuilder::tls_aia`](crate::ClientBuilder::tls_aia)), for its caller: a proxy
+/// answering its own client meanwhile (see
+/// [`RequestBuilder::alps_gate`](crate::RequestBuilder::alps_gate)). The handshake pauses
+/// when the server negotiated application settings (ALPS), for the settings it sends,
+/// when its certificate failed verification (see [`TlsInfo::verify_error`]), for whether
+/// it goes on trusting that leaf certificate alone, and, unless it paused for either, when
+/// the server asks in its handshake for a client certificate the connection has none
+/// configured for, for whether it goes on without one; [`AlpsGate::paused`] resolves with
+/// what the server sent so far when it does. It also tells when the server asks for a
+/// client certificate past the handshake (see [`AlpsGate::late_certificate_request`]), and
+/// when it sends anything past its handshake (see [`AlpsGate::post_handshake_message`]).
+#[derive(Clone, Debug)]
+pub struct AlpsGate {
+    paused: tokio::sync::watch::Sender<Option<TlsInfo>>,
+    verdict: tokio::sync::watch::Sender<Option<Verdict>>,
+    late_certificate_request: tokio::sync::watch::Sender<bool>,
+    post_handshake_message: tokio::sync::watch::Sender<bool>,
+}
+
+/// What a paused handshake does once its [`AlpsGate`]'s caller decides.
+#[derive(Clone, Debug)]
+pub(crate) enum Verdict {
+    /// Goes on, sending these application settings (none: the ones configured).
+    Accept(Option<Vec<u8>>),
+    /// Ends, rejecting the server's certificate with this alert (none: BoringSSL's).
+    Reject(Option<u8>),
+    /// Ends without an alert, the connection closed once what the server sent is read.
+    Close,
+    /// Ends with a close_notify, the connection closed once what the server sent is read.
+    CloseNotify,
+}
+
+impl Default for AlpsGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AlpsGate {
+    /// A gate no handshake has paused on yet.
+    pub fn new() -> Self {
+        Self {
+            paused: tokio::sync::watch::Sender::new(None),
+            verdict: tokio::sync::watch::Sender::new(None),
+            late_certificate_request: tokio::sync::watch::Sender::new(false),
+            post_handshake_message: tokio::sync::watch::Sender::new(false),
+        }
+    }
+
+    /// Resolves once the handshake pauses, with the server's flight so far.
+    pub async fn paused(&self) -> TlsInfo {
+        let mut paused = self.paused.subscribe();
+        loop {
+            if let Some(info) = paused.borrow_and_update().clone() {
+                return info;
+            }
+            if paused.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    /// Supplies the settings the connection sends (none: the ones it was configured
+    /// with), resuming its handshake, on the server's certificate should it have failed
+    /// verification.
+    pub fn supply(&self, settings: Option<Vec<u8>>) {
+        self.verdict.send_replace(Some(Verdict::Accept(settings)));
+    }
+
+    /// Ends the handshake, rejecting the server's certificate with `alert`, or the one
+    /// BoringSSL sends for its verification failure (`certificate_unknown` for one that
+    /// verified). A handshake paused for a client certificate ends with `alert`, or
+    /// `internal_error` without one.
+    pub fn reject(&self, alert: Option<u8>) {
+        self.verdict.send_replace(Some(Verdict::Reject(alert)));
+    }
+
+    /// Ends the handshake without an alert, as a client closing its connection does: what
+    /// the server sent so far is read first, so the connection ends with a FIN, not the
+    /// reset a socket closed with unread data sends.
+    pub fn close(&self) {
+        self.verdict.send_replace(Some(Verdict::Close));
+    }
+
+    /// Ends the handshake with a close_notify and no other alert, as a client closing its
+    /// connection with one does, the connection then closed as [`Self::close`] closes it.
+    pub fn close_notify(&self) {
+        self.verdict.send_replace(Some(Verdict::CloseNotify));
+    }
+
+    /// Resolves with `true` once the server asks for a client certificate past the
+    /// handshake (TLS 1.3 post-handshake authentication, or a TLS 1.2 renegotiation's), or
+    /// with `false` once the connection, and every clone of this gate, is gone without it
+    /// asking.
+    pub fn late_certificate_request(&self) -> impl Future<Output = bool> + Send + 'static {
+        let mut requested = self.late_certificate_request.subscribe();
+        async move { requested.wait_for(|requested| *requested).await.is_ok() }
+    }
+
+    pub(crate) fn note_late_certificate_request(&self) {
+        self.late_certificate_request.send_replace(true);
+    }
+
+    /// Resolves with `true` once the server sends a handshake message past its handshake
+    /// (a NewSessionTicket, KeyUpdate or CertificateRequest), read as the connection is,
+    /// or with `false` once the connection, and every clone of this gate, is gone without
+    /// it sending one.
+    pub fn post_handshake_message(&self) -> impl Future<Output = bool> + Send + 'static {
+        let mut sent = self.post_handshake_message.subscribe();
+        async move { sent.wait_for(|sent| *sent).await.is_ok() }
+    }
+
+    pub(crate) fn note_post_handshake_message(&self) {
+        self.post_handshake_message.send_replace(true);
+    }
+
+    pub(crate) fn pause(&self, info: TlsInfo) {
+        self.paused.send_replace(Some(info));
+    }
+
+    pub(crate) async fn verdict(&self) -> Verdict {
+        let mut verdict = self.verdict.subscribe();
+        loop {
+            if let Some(verdict) = verdict.borrow_and_update().clone() {
+                return verdict;
+            }
+            if verdict.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+}
+
+/// A TLS handshake message type this crate names for callers reading a [`ServerFlight`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HandshakeType {
+    /// A ServerHello (TLS 1.2 and 1.3).
+    ServerHello,
+    /// A ServerHello whose random is the RFC 8446 HelloRetryRequest marker.
+    HelloRetryRequest,
+    /// A TLS 1.3 EncryptedExtensions message.
+    EncryptedExtensions,
+    /// A Certificate message.
+    Certificate,
+    /// A CertificateVerify message.
+    CertificateVerify,
+    /// A TLS 1.2 ServerKeyExchange message.
+    ServerKeyExchange,
+    /// A CertificateRequest message (client authentication).
+    CertificateRequest,
+    /// A TLS 1.2 ServerHelloDone message.
+    ServerHelloDone,
+    /// A NewSessionTicket message.
+    NewSessionTicket,
+    /// A Finished message.
+    Finished,
+    /// Any other handshake type, by its wire code.
+    Other(u8),
+}
+
+impl ServerFlight {
+    /// The well-known SHA-256 marker a ServerHello carries as its random to signal a
+    /// HelloRetryRequest (RFC 8446 section 4.1.3).
+    const HRR_RANDOM: [u8; 32] = [
+        0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8,
+        0x91, 0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8,
+        0x33, 0x9C,
+    ];
+
+    /// The raw handshake messages received so far, in order (type + 3-byte length + body).
+    #[must_use]
+    pub fn messages(&self) -> &[Bytes] {
+        &self.messages
+    }
+
+    /// The classified messages received so far, in order: each type paired with its raw
+    /// bytes (type + 3-byte length + body). A ServerHello carrying the HRR random is
+    /// reported as [`HandshakeType::HelloRetryRequest`].
+    #[must_use]
+    pub fn classified(&self) -> Vec<(HandshakeType, &Bytes)> {
+        self.messages
+            .iter()
+            .map(|msg| (Self::classify(msg), msg))
+            .collect()
+    }
+
+    fn classify(msg: &Bytes) -> HandshakeType {
+        match msg.first().copied() {
+            Some(2) => {
+                // ServerHello: type(1) len(3) legacy_version(2) random(32)...
+                let random = msg.get(6..38);
+                if random == Some(&Self::HRR_RANDOM[..]) {
+                    HandshakeType::HelloRetryRequest
+                } else {
+                    HandshakeType::ServerHello
+                }
+            }
+            Some(8) => HandshakeType::EncryptedExtensions,
+            Some(11) => HandshakeType::Certificate,
+            Some(15) => HandshakeType::CertificateVerify,
+            Some(12) => HandshakeType::ServerKeyExchange,
+            Some(13) => HandshakeType::CertificateRequest,
+            Some(14) => HandshakeType::ServerHelloDone,
+            Some(4) => HandshakeType::NewSessionTicket,
+            Some(20) => HandshakeType::Finished,
+            Some(other) => HandshakeType::Other(other),
+            None => HandshakeType::Other(0),
+        }
+    }
+
+    /// The number of NewSessionTicket messages received so far.
+    #[must_use]
+    pub fn ticket_count(&self) -> usize {
+        self.messages
+            .iter()
+            .filter(|msg| matches!(Self::classify(msg), HandshakeType::NewSessionTicket))
+            .count()
+    }
+}
+
+impl From<Vec<Bytes>> for ServerFlight {
+    fn from(messages: Vec<Bytes>) -> Self {
+        Self { messages }
+    }
+}
+
+/// The connection a [`TlsInfo`] was taken from, shared by every response it carries.
+#[derive(Debug, Default)]
+pub(crate) struct TlsConnectionUse {
+    id: std::sync::OnceLock<u64>,
+    responses: std::sync::atomic::AtomicU64,
 }
 
 impl TlsInfo {
+    /// The negotiated protocol version, e.g. `TLSv1.3`.
+    pub fn version(&self) -> &str {
+        self.version
+    }
+
+    /// The negotiated cipher suite, by its standard (RFC) name when it has one.
+    pub fn cipher(&self) -> Option<&str> {
+        self.cipher
+    }
+
+    /// The protocol selected through ALPN, if any.
+    pub fn alpn_protocol(&self) -> Option<&[u8]> {
+        self.alpn_protocol.as_deref()
+    }
+
+    /// The negotiated key exchange group's TLS id (e.g. 29 for X25519), if any.
+    pub fn group(&self) -> Option<u16> {
+        self.group
+    }
+
+    /// Whether the server answered the first ClientHello with a HelloRetryRequest.
+    pub fn hello_retry_request(&self) -> bool {
+        self.hello_retry_request
+    }
+
+    /// The size, in bits, of the prime of the TLS 1.2 DHE group the connection's session was
+    /// established with, by this handshake or the one it resumed, if it used one.
+    pub fn dhe_bits(&self) -> Option<u16> {
+        self.dhe_bits
+    }
+
+    /// Why the server's certificate failed verification, if it did (a handshake goes on past
+    /// that without verification, or as its [`AlpsGate`] decides): the `X509_V_ERR_*` code
+    /// and its description.
+    pub fn verify_error(&self) -> Option<(i32, &'static str)> {
+        self.verify_error
+    }
+
+    /// The caIssuers URLs whose issuers the certificate verification needed (see
+    /// [`AiaCache`](trust::AiaCache)), in the order it needed them.
+    pub fn aia_fetches(&self) -> &[trust::AiaFetch] {
+        &self.aia_fetches
+    }
+
+    /// The ClientHello handshake message (type, length and body, without the record
+    /// header) this connection sent first.
+    pub fn client_hello(&self) -> Option<&[u8]> {
+        self.client_hello.as_deref()
+    }
+
+    /// The origin's server flight: the raw handshake messages it sent this connection, in
+    /// order, as captured so far — the NewSessionTickets arrive after the handshake, once
+    /// the connection is read. See [`ServerFlight`].
+    pub fn server_flight(&self) -> Option<ServerFlight> {
+        self.server_flight
+            .as_ref()
+            .map(|messages| ServerFlight::from(messages.lock().clone()))
+    }
+
+    /// The DER OCSP response the origin stapled (its `CertificateStatus` / TLS 1.3
+    /// status_request), if it stapled one and this connection requested stapling.
+    pub fn peer_ocsp(&self) -> Option<&[u8]> {
+        self.peer_ocsp.as_deref()
+    }
+
+    /// An id for the TLS connection this response arrived on, the same for every response
+    /// it carries: `assign` provides it for the connection's first caller.
+    pub fn connection_id(&self, assign: impl FnOnce() -> u64) -> u64 {
+        *self.connection.id.get_or_init(assign)
+    }
+
+    /// Counts one response carried by this connection and returns how many it carried
+    /// before, so the first response on a fresh connection reads `0`.
+    pub fn count_response(&self) -> u64 {
+        self.connection
+            .responses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Get the DER encoded leaf certificate of the peer.
     pub fn peer_certificate(&self) -> Option<&[u8]> {
         self.peer_certificate.as_deref()
@@ -37,6 +391,17 @@ impl TlsInfo {
         self.peer_certificate_chain
             .as_ref()
             .map(|v| v.iter().map(|b| b.as_ref()))
+    }
+
+    /// The certification path verifying the peer certificate built, leaf first (DER): from
+    /// the certificates the peer sent, and any issuers fetched, to the trust anchor it
+    /// reached, else as far as it got. `None` when the handshake verified none (a resumed
+    /// session) or its client verifies without an [`AiaCache`](trust::AiaCache) (see
+    /// [`ClientBuilder::tls_aia`](crate::ClientBuilder::tls_aia)).
+    pub fn verified_path(&self) -> Option<impl Iterator<Item = &[u8]>> {
+        self.verified_path
+            .as_ref()
+            .map(|path| path.iter().map(|cert| cert.as_ref()))
     }
 }
 
@@ -59,18 +424,24 @@ impl TlsVersion {
 }
 
 /// A TLS ALPN protocol.
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
-pub struct AlpnProtocol(&'static [u8]);
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct AlpnProtocol(Cow<'static, [u8]>);
 
 impl AlpnProtocol {
     /// Prefer HTTP/1.1
-    pub const HTTP1: AlpnProtocol = AlpnProtocol(b"http/1.1");
+    pub const HTTP1: AlpnProtocol = AlpnProtocol(Cow::Borrowed(b"http/1.1"));
 
     /// Prefer HTTP/2
-    pub const HTTP2: AlpnProtocol = AlpnProtocol(b"h2");
+    pub const HTTP2: AlpnProtocol = AlpnProtocol(Cow::Borrowed(b"h2"));
 
     /// Prefer HTTP/3
-    pub const HTTP3: AlpnProtocol = AlpnProtocol(b"h3");
+    pub const HTTP3: AlpnProtocol = AlpnProtocol(Cow::Borrowed(b"h3"));
+
+    /// A protocol by its identification sequence, such as any a client offered.
+    #[inline]
+    pub fn new(id: impl Into<Cow<'static, [u8]>>) -> AlpnProtocol {
+        AlpnProtocol(id.into())
+    }
 
     #[inline]
     fn encode(self) -> Bytes {
@@ -84,7 +455,7 @@ impl AlpnProtocol {
         let mut buf = BytesMut::new();
         for item in items {
             buf.put_u8(item.0.len() as u8);
-            buf.extend_from_slice(item.0);
+            buf.extend_from_slice(&item.0);
         }
         buf.freeze()
     }
@@ -93,7 +464,7 @@ impl AlpnProtocol {
 impl PartialEq<[u8]> for AlpnProtocol {
     #[inline]
     fn eq(&self, other: &[u8]) -> bool {
-        self.0 == other
+        *self.0 == *other
     }
 }
 
@@ -220,6 +591,12 @@ pub struct TlsOptions {
     /// **Default:** `None`
     pub record_size_limit: Option<u16>,
 
+    /// Sets the max_fragment_length mode (RFC 6066) to send as given, an invalid one such as
+    /// zero included.
+    ///
+    /// **Default:** `None`
+    pub max_fragment_length: Option<u8>,
+
     /// Whether to skip session tickets when using PSK.
     ///
     /// **Default:** `false`
@@ -279,6 +656,133 @@ pub struct TlsOptions {
     ///
     /// **Default:** `None`
     pub extension_permutation: Option<Cow<'static, [ExtensionType]>>,
+
+    /// Starts the `signature_algorithms` extension with a GREASE value
+    /// ([RFC 8701](https://datatracker.ietf.org/doc/html/rfc8701)).
+    ///
+    /// **Default:** `false`
+    pub grease_signature_algorithms: bool,
+
+    /// Whether [`Self::extension_permutation`] is the ClientHello's whole extension list: the
+    /// listed extensions are sent in that order, each when its configuration calls for it, and
+    /// no others. A GREASE value places a GREASE extension, [`ExtensionType::PADDING`] a padding
+    /// extension of [`Self::padding_length`] bytes, [`ExtensionType::SIGNATURE_ALGORITHMS_CERT`]
+    /// the [`Self::offered_sigalgs_cert`] list if set, and [`ExtensionType::ENCRYPT_THEN_MAC`] an
+    /// encrypt_then_mac extension, which BoringSSL does not implement: a server accepting it for
+    /// a CBC cipher suite is an offer-only selection (see [`Self::offered_cipher_suites`]).
+    ///
+    /// **Default:** `false`
+    pub strict_extension_order: bool,
+
+    /// Whether TLS 1.3 connections offer post-handshake authentication (RFC 8446, section
+    /// 4.2.6) with a post_handshake_auth extension, placed where a strict extension order
+    /// lists [`ExtensionType::POST_HANDSHAKE_AUTH`]. The connection answers each
+    /// post-handshake CertificateRequest with its client certificate ([`Identity`]), or an
+    /// empty Certificate without one.
+    ///
+    /// **Default:** `false`
+    pub post_handshake_auth: bool,
+
+    /// The cipher suite list the initial ClientHello writes, verbatim and in order, each GREASE
+    /// value standing for the connection's GREASE value. It may offer suites BoringSSL does not
+    /// implement or [`Self::cipher_list`] does not enable: only the enabled ones it offers are
+    /// negotiated, and a server selecting another fails the handshake as an offer-only
+    /// selection (see [`HandshakeFailure::offer_only_selection`]). The `offered_*` lists below
+    /// work alike.
+    ///
+    /// **Default:** `None`
+    pub offered_cipher_suites: Option<Cow<'static, [u16]>>,
+
+    /// The supported_groups list the initial ClientHello writes; [`Self::curves_list`] is
+    /// what is negotiated.
+    ///
+    /// **Default:** `None`
+    pub offered_groups: Option<Cow<'static, [u16]>>,
+
+    /// The groups the initial ClientHello sends key shares for, in order, a GREASE value
+    /// placing a GREASE key share: each an enabled group [`Self::offered_groups`] offers, at
+    /// most once. Takes precedence over [`Self::key_shares`].
+    ///
+    /// **Default:** `None`
+    pub offered_key_shares: Option<Cow<'static, [u16]>>,
+
+    /// The supported_versions list the initial ClientHello writes, sent even when the
+    /// maximum version is below TLS 1.3; [`Self::min_tls_version`] to
+    /// [`Self::max_tls_version`] is what is negotiated.
+    ///
+    /// **Default:** `None`
+    pub offered_versions: Option<Cow<'static, [u16]>>,
+
+    /// The signature_algorithms list the initial ClientHello writes; [`Self::sigalgs_list`]
+    /// is what is negotiated. A server certificate whose key type BoringSSL does not implement
+    /// is also an offer-only selection when this offers algorithms `sigalgs_list` lacks.
+    ///
+    /// **Default:** `None`
+    pub offered_sigalgs: Option<Cow<'static, [u16]>>,
+
+    /// The signature_algorithms_cert list the initial ClientHello writes where a strict
+    /// extension order places it (see [`Self::strict_extension_order`]).
+    ///
+    /// **Default:** `None`
+    pub offered_sigalgs_cert: Option<Cow<'static, [u16]>>,
+
+    /// The ec_point_formats list the initial ClientHello writes. BoringSSL takes only
+    /// uncompressed points, so a server's compressed ECDHE point is an offer-only selection
+    /// when this offers a compressed format.
+    ///
+    /// **Default:** `None`
+    pub offered_point_formats: Option<Cow<'static, [u8]>>,
+
+    /// The length of the padding extension a strict extension order places.
+    ///
+    /// **Default:** `0`
+    pub padding_length: u16,
+
+    /// Ends the cipher suite list with TLS_EMPTY_RENEGOTIATION_INFO_SCSV
+    /// ([RFC 5746](https://datatracker.ietf.org/doc/html/rfc5746)).
+    ///
+    /// **Default:** `false`
+    pub renegotiation_scsv: bool,
+
+    /// Trust anchor IDs to request, as the encoded list of the `trust_anchors` extension.
+    ///
+    /// **Default:** `None`
+    pub trust_anchors: Option<Cow<'static, [u8]>>,
+
+    /// The length of the random legacy session ID a ClientHello resuming no session by ID
+    /// or TLS 1.2 ticket carries, at most 32 bytes; a TLS 1.3 one without also sends no
+    /// compatibility mode ChangeCipherSpec. `None` sends 32 bytes when offering TLS 1.3,
+    /// else none.
+    ///
+    /// **Default:** `None`
+    pub session_id_length: Option<u8>,
+
+    /// The record version of the handshake records carrying the ClientHello (those written
+    /// before the server's first byte), rather than BoringSSL's TLS 1.0 (`0x0301`).
+    ///
+    /// **Default:** `None`
+    pub hello_record_version: Option<u16>,
+
+    /// The fragment lengths of the handshake records carrying the ClientHello, all but its
+    /// last: the ClientHello goes out in records of these lengths, while it lasts, and the
+    /// rest of it in one record (in records of at most 2^14 bytes, a longer rest), rather
+    /// than in the records BoringSSL writes.
+    ///
+    /// **Default:** `None`
+    pub hello_record_layout: Option<Cow<'static, [u16]>>,
+
+    /// The length of the random payload of the GREASE ECH extension (see
+    /// [`TlsOptions::enable_ech_grease`]), at least 1 byte. `None` picks a random multiple of
+    /// 32 bytes from 128 to 224 plus the 16-byte AEAD tag.
+    ///
+    /// **Default:** `None`
+    pub ech_grease_payload_length: Option<u16>,
+
+    /// The HPKE `(kdf_id, aead_id)` cipher suite the GREASE ECH extension names, as given.
+    /// `None` names HKDF-SHA256 with AES-128-GCM with AES hardware, else ChaCha20-Poly1305.
+    ///
+    /// **Default:** `None`
+    pub ech_grease_cipher_suite: Option<(u16, u16)>,
 
     /// Overrides AES hardware acceleration.
     ///
@@ -400,6 +904,13 @@ impl TlsOptionsBuilder {
         self
     }
 
+    /// Sets the max_fragment_length mode.
+    #[inline]
+    pub fn max_fragment_length<U: Into<Option<u8>>>(mut self, mode: U) -> Self {
+        self.config.max_fragment_length = mode.into();
+        self
+    }
+
     /// Sets the PSK skip session ticket flag.
     #[inline]
     pub fn psk_skip_session_ticket(mut self, skip: bool) -> Self {
@@ -491,6 +1002,171 @@ impl TlsOptionsBuilder {
         self
     }
 
+    /// Sets whether to start the `signature_algorithms` extension with a GREASE value.
+    #[inline]
+    pub fn grease_signature_algorithms(mut self, enabled: bool) -> Self {
+        self.config.grease_signature_algorithms = enabled;
+        self
+    }
+
+    /// Sets whether the extension permutation is the ClientHello's whole extension list.
+    #[inline]
+    pub fn strict_extension_order(mut self, enabled: bool) -> Self {
+        self.config.strict_extension_order = enabled;
+        self
+    }
+
+    /// Sets whether TLS 1.3 connections offer post-handshake authentication.
+    #[inline]
+    pub fn post_handshake_auth(mut self, enabled: bool) -> Self {
+        self.config.post_handshake_auth = enabled;
+        self
+    }
+
+    /// Sets the cipher suite list the initial ClientHello writes.
+    #[inline]
+    pub fn offered_cipher_suites<T>(mut self, suites: T) -> Self
+    where
+        T: Into<Cow<'static, [u16]>>,
+    {
+        self.config.offered_cipher_suites = Some(suites.into());
+        self
+    }
+
+    /// Sets the supported_groups list the initial ClientHello writes.
+    #[inline]
+    pub fn offered_groups<T>(mut self, groups: T) -> Self
+    where
+        T: Into<Cow<'static, [u16]>>,
+    {
+        self.config.offered_groups = Some(groups.into());
+        self
+    }
+
+    /// Sets the groups the initial ClientHello sends key shares for.
+    #[inline]
+    pub fn offered_key_shares<T>(mut self, groups: T) -> Self
+    where
+        T: Into<Cow<'static, [u16]>>,
+    {
+        self.config.offered_key_shares = Some(groups.into());
+        self
+    }
+
+    /// Sets the supported_versions list the initial ClientHello writes.
+    #[inline]
+    pub fn offered_versions<T>(mut self, versions: T) -> Self
+    where
+        T: Into<Cow<'static, [u16]>>,
+    {
+        self.config.offered_versions = Some(versions.into());
+        self
+    }
+
+    /// Sets the signature_algorithms list the initial ClientHello writes.
+    #[inline]
+    pub fn offered_sigalgs<T>(mut self, sigalgs: T) -> Self
+    where
+        T: Into<Cow<'static, [u16]>>,
+    {
+        self.config.offered_sigalgs = Some(sigalgs.into());
+        self
+    }
+
+    /// Sets the signature_algorithms_cert list the initial ClientHello writes.
+    #[inline]
+    pub fn offered_sigalgs_cert<T>(mut self, sigalgs: T) -> Self
+    where
+        T: Into<Cow<'static, [u16]>>,
+    {
+        self.config.offered_sigalgs_cert = Some(sigalgs.into());
+        self
+    }
+
+    /// Sets the ec_point_formats list the initial ClientHello writes.
+    #[inline]
+    pub fn offered_point_formats<T>(mut self, formats: T) -> Self
+    where
+        T: Into<Cow<'static, [u8]>>,
+    {
+        self.config.offered_point_formats = Some(formats.into());
+        self
+    }
+
+    /// Sets the length of the padding extension a strict extension order places.
+    #[inline]
+    pub fn padding_length(mut self, len: u16) -> Self {
+        self.config.padding_length = len;
+        self
+    }
+
+    /// Sets whether to end the cipher suite list with TLS_EMPTY_RENEGOTIATION_INFO_SCSV.
+    #[inline]
+    pub fn renegotiation_scsv(mut self, enabled: bool) -> Self {
+        self.config.renegotiation_scsv = enabled;
+        self
+    }
+
+    /// Sets the trust anchor IDs to request.
+    #[inline]
+    pub fn trust_anchors<T>(mut self, ids: T) -> Self
+    where
+        T: Into<Cow<'static, [u8]>>,
+    {
+        self.config.trust_anchors = Some(ids.into());
+        self
+    }
+
+    /// Sets the length of the legacy session ID a ClientHello resuming no session carries.
+    #[inline]
+    pub fn session_id_length<T>(mut self, len: T) -> Self
+    where
+        T: Into<Option<u8>>,
+    {
+        self.config.session_id_length = len.into();
+        self
+    }
+
+    /// Sets the record version of the records carrying the ClientHello.
+    #[inline]
+    pub fn hello_record_version<T>(mut self, version: T) -> Self
+    where
+        T: Into<Option<u16>>,
+    {
+        self.config.hello_record_version = version.into();
+        self
+    }
+
+    /// Sets the fragment lengths of the records carrying the ClientHello, all but its last.
+    #[inline]
+    pub fn hello_record_layout<T>(mut self, layout: T) -> Self
+    where
+        T: Into<Cow<'static, [u16]>>,
+    {
+        self.config.hello_record_layout = Some(layout.into());
+        self
+    }
+
+    /// Sets the length of the GREASE ECH extension's random payload.
+    #[inline]
+    pub fn ech_grease_payload_length<T>(mut self, len: T) -> Self
+    where
+        T: Into<Option<u16>>,
+    {
+        self.config.ech_grease_payload_length = len.into();
+        self
+    }
+
+    /// Sets the HPKE `(kdf_id, aead_id)` cipher suite the GREASE ECH extension names.
+    #[inline]
+    pub fn ech_grease_cipher_suite<T>(mut self, suite: T) -> Self
+    where
+        T: Into<Option<(u16, u16)>>,
+    {
+        self.config.ech_grease_cipher_suite = suite.into();
+        self
+    }
+
     /// Sets the AES hardware override flag.
     #[inline]
     pub fn aes_hw_override<T>(mut self, enabled: T) -> Self
@@ -561,6 +1237,7 @@ impl Default for TlsOptions {
             enable_ocsp_stapling: false,
             enable_signed_cert_timestamps: false,
             record_size_limit: None,
+            max_fragment_length: None,
             psk_skip_session_ticket: false,
             key_shares: None,
             psk_dhe_ke: true,
@@ -571,6 +1248,24 @@ impl Default for TlsOptions {
             sigalgs_list: None,
             certificate_compressors: None,
             extension_permutation: None,
+            grease_signature_algorithms: false,
+            strict_extension_order: false,
+            post_handshake_auth: false,
+            offered_cipher_suites: None,
+            offered_groups: None,
+            offered_key_shares: None,
+            offered_versions: None,
+            offered_sigalgs: None,
+            offered_sigalgs_cert: None,
+            offered_point_formats: None,
+            padding_length: 0,
+            renegotiation_scsv: false,
+            trust_anchors: None,
+            session_id_length: None,
+            hello_record_version: None,
+            hello_record_layout: None,
+            ech_grease_payload_length: None,
+            ech_grease_cipher_suite: None,
             aes_hw_override: None,
             preserve_tls13_cipher_list: None,
             random_aes_hw_override: false,

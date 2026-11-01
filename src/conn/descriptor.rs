@@ -10,7 +10,14 @@ use std::{
 use http::{Uri, Version};
 use lru::DefaultHasher;
 
-use crate::{conn::net::SocketBindOptions, group::Group, proxy::Matcher, tls::TlsOptions};
+#[cfg(feature = "tokio-rt")]
+use crate::tls::conn::Preconnected;
+use crate::{
+    conn::net::SocketBindOptions,
+    group::{Group, ScopeRef},
+    proxy::Matcher,
+    tls::TlsOptions,
+};
 
 /// A key that uniquely identifies a group of interchangeable connections for pooling.
 ///
@@ -32,10 +39,33 @@ pub(crate) struct ConnectionDescriptor {
     proxy: Option<Matcher>,
     tls_options: Option<TlsOptions>,
     socket_bind: Option<SocketBindOptions>,
+    scope: Option<ScopeRef>,
+    tls_name: Option<(Box<str>, bool)>,
+    accepted_certificate: Option<[u8; 32]>,
+    min_dhe_bits: Option<u16>,
+    #[cfg(feature = "tokio-rt")]
+    preconnected: Option<Preconnected>,
     connection_id: ConnectionId,
+    session_id: ConnectionId,
+    unversioned_id: Option<ConnectionId>,
 }
 
 // ===== impl ConnectionId =====
+
+impl ConnectionId {
+    /// The ID of the connections `group` describes.
+    pub(crate) fn new(group: Group) -> Self {
+        ConnectionId(Arc::new((group, AtomicU64::new(u64::MIN))))
+    }
+
+    /// The ID of the connections this one identifies once they also accept the leaf
+    /// certificate whose DER has the SHA-256 `leaf_sha256` should verification fail.
+    pub(crate) fn accepting(&self, leaf_sha256: [u8; 32]) -> Self {
+        let mut group = self.0.0.clone();
+        group.accepted_certificate(Some(leaf_sha256));
+        Self::new(group)
+    }
+}
 
 impl Hash for ConnectionId {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -76,18 +106,36 @@ impl ConnectionDescriptor {
     pub(crate) fn new(
         uri: Uri,
         mut group: Group,
+        scope: Option<ScopeRef>,
         proxy: Option<Matcher>,
         version: Option<Version>,
         tls_options: Option<TlsOptions>,
         socket_bind: Option<SocketBindOptions>,
     ) -> ConnectionDescriptor {
-        let connection_id = {
-            group
-                .uri(uri.clone())
-                .version(version)
-                .proxy(proxy.clone())
-                .socket_bind(socket_bind.clone());
-            ConnectionId(Arc::new((group, AtomicU64::new(u64::MIN))))
+        let id = |group| ConnectionId(Arc::new((group, AtomicU64::new(u64::MIN))));
+        group
+            .uri(uri.clone())
+            .proxy(proxy.clone())
+            .socket_bind(socket_bind.clone());
+        // An idle HTTP/1 connection opened without a forced version serves a request that
+        // forces HTTP/1 just as well.
+        let mut unversioned =
+            matches!(version, Some(Version::HTTP_10 | Version::HTTP_11)).then(|| group.clone());
+        group.version(version);
+        // TLS sessions resume across scopes; connections stay within theirs.
+        let (connection_id, session_id) = match &scope {
+            Some(scope) => {
+                let session_id = id(group.clone());
+                group.scope(scope.clone());
+                if let Some(unversioned) = &mut unversioned {
+                    unversioned.scope(scope.clone());
+                }
+                (id(group), session_id)
+            }
+            None => {
+                let connection_id = id(group);
+                (connection_id.clone(), connection_id)
+            }
         };
 
         ConnectionDescriptor {
@@ -96,8 +144,62 @@ impl ConnectionDescriptor {
             version,
             tls_options,
             socket_bind,
+            scope,
+            tls_name: None,
+            accepted_certificate: None,
+            min_dhe_bits: None,
+            #[cfg(feature = "tokio-rt")]
+            preconnected: None,
             connection_id,
+            session_id,
+            unversioned_id: unversioned.map(id),
         }
+    }
+
+    /// Sets the name the TLS handshake verifies instead of the URI host, and whether it
+    /// announces it (SNI).
+    pub(crate) fn with_tls_name(mut self, tls_name: Option<(Box<str>, bool)>) -> Self {
+        self.tls_name = tls_name;
+        self
+    }
+
+    /// Sets the SHA-256 of the leaf certificate (its DER) the TLS handshake accepts even
+    /// when verification fails.
+    pub(crate) fn with_accepted_certificate(mut self, leaf_sha256: Option<[u8; 32]>) -> Self {
+        self.accepted_certificate = leaf_sha256;
+        self
+    }
+
+    /// Sets the size, in bits, of the smallest DHE group a new connection's TLS 1.2 handshake
+    /// accepts instead of BoringSSL's 2048. Its connections serve only requests setting the
+    /// same, while TLS sessions resume across.
+    pub(crate) fn with_min_dhe_bits(mut self, bits: Option<u16>) -> Self {
+        if let Some(bits) = bits {
+            for id in [Some(&mut self.connection_id), self.unversioned_id.as_mut()]
+                .into_iter()
+                .flatten()
+            {
+                let mut group = id.0.0.clone();
+                group.min_dhe_bits(bits);
+                *id = ConnectionId::new(group);
+            }
+        }
+        self.min_dhe_bits = bits;
+        self
+    }
+
+    /// Offers a connection for the connection attempt to adopt instead of opening one.
+    #[cfg(feature = "tokio-rt")]
+    pub(crate) fn with_preconnected(mut self, preconnected: Option<Preconnected>) -> Self {
+        self.preconnected = preconnected;
+        self
+    }
+
+    /// The connection offered for adoption, if any.
+    #[cfg(feature = "tokio-rt")]
+    #[inline]
+    pub(crate) fn preconnected(&self) -> Option<&Preconnected> {
+        self.preconnected.as_ref()
     }
 
     /// Returns a [`ConnectionId`] group ID for this descriptor.
@@ -106,16 +208,60 @@ impl ConnectionDescriptor {
         self.connection_id.clone()
     }
 
+    /// For a request that forces HTTP/1, the ID its connections would have without the
+    /// forced version: idle HTTP/1 connections there can serve it too.
+    #[inline]
+    pub(crate) fn unversioned_id(&self) -> Option<&ConnectionId> {
+        self.unversioned_id.as_ref()
+    }
+
+    /// Returns the ID the connection's TLS sessions are cached under.
+    #[inline]
+    pub(crate) fn session_id(&self) -> ConnectionId {
+        self.session_id.clone()
+    }
+
+    /// Returns the scope the connection is confined to, if any.
+    #[inline]
+    pub(crate) fn scope(&self) -> Option<&ScopeRef> {
+        self.scope.as_ref()
+    }
+
+    /// Returns the name the TLS handshake verifies instead of the URI host, and whether it
+    /// announces it, if set.
+    #[inline]
+    pub(crate) fn tls_name(&self) -> Option<(&str, bool)> {
+        self.tls_name.as_ref().map(|(name, sni)| (&**name, *sni))
+    }
+
+    /// Returns the SHA-256 of the leaf certificate the TLS handshake accepts even when
+    /// verification fails, if set.
+    #[inline]
+    pub(crate) fn accepted_certificate(&self) -> Option<[u8; 32]> {
+        self.accepted_certificate
+    }
+
+    /// Returns the size, in bits, of the smallest DHE group the TLS handshake accepts, if
+    /// set.
+    #[inline]
+    pub(crate) fn min_dhe_bits(&self) -> Option<u16> {
+        self.min_dhe_bits
+    }
+
     /// Returns a reference to the [`Uri`].
     #[inline]
     pub(crate) fn uri(&self) -> &Uri {
         &self.uri
     }
 
-    /// Returns a mutable reference to the [`Uri`].
+    /// Opens the connection to `uri` itself (a proxy), whose TLS then names its host,
+    /// accepts no certificate failing verification and no DHE group below 2048 bits.
     #[inline]
-    pub(crate) fn uri_mut(&mut self) -> &mut Uri {
-        &mut self.uri
+    pub(crate) fn set_uri(&mut self, uri: Uri) {
+        self.uri = uri;
+        self.tls_name = None;
+        self.accepted_certificate = None;
+        self.min_dhe_bits = None;
     }
 
     /// Return the negotiated HTTP version, if any.

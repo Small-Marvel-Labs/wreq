@@ -328,15 +328,19 @@ pub use self::client::ws;
 pub use self::{
     client::{
         Client, ClientBuilder,
-        body::Body,
+        body::{Body, ReadAheadOnHttp1},
         emulate::{Emulation, EmulationBuilder, IntoEmulation},
+        layer::client::NoHostOnHttp1,
         request::{Request, RequestBuilder},
         response::Response,
         upgrade::Upgraded,
     },
     error::{Error, Result},
     ext::{ResponseBuilderExt, ResponseExt},
-    group::Group,
+    group::{
+        ConnectionEnd, ConnectionScope, Group, Http2OriginEnd, Http2OriginEnds, OnOriginEnd,
+        OnQueued, OriginEnd, ScopeEnded,
+    },
     into_uri::IntoUri,
     proxy::{NoProxy, Proxy},
 };
@@ -350,11 +354,14 @@ pub mod http1 {
 pub mod http2 {
     //! HTTP/2 protocol implementation and utilities.
 
-    pub use http2::frame::{
-        Priorities, PrioritiesBuilder, Priority, PseudoId, PseudoOrder, Setting, SettingId,
-        SettingsOrder, SettingsOrderBuilder, StreamDependency, StreamId,
+    pub use http2::{
+        ext::ResponsePosition,
+        frame::{
+            Priorities, PrioritiesBuilder, Priority, PseudoId, PseudoOrder, Setting, SettingId,
+            SettingsOrder, SettingsOrderBuilder, StreamDependency, StreamId,
+        },
     };
-    pub use wreq_proto::http2::{Http2Options, Http2OptionsBuilder};
+    pub use wreq_proto::http2::{Control, Http2Options, Http2OptionsBuilder, LoggedFrame};
 }
 
 pub use http::{Method, StatusCode, Uri, Version};

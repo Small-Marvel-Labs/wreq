@@ -23,6 +23,7 @@ use std::{
 };
 
 use http::header::{HeaderMap, HeaderValue, USER_AGENT};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tower::{
     BoxError, Layer, Service, ServiceBuilder, ServiceExt,
     retry::{Retry, RetryLayer},
@@ -73,10 +74,11 @@ use crate::{
     retry,
     rt::{BoxSendFuture, Executor, Timer},
     tls::{
-        AlpnProtocol, TlsOptions, TlsVersion,
+        AlpnProtocol, TlsOptions, TlsStream, TlsVersion,
+        conn::TlsConnector,
         keylog::KeyLog,
         session::{IntoTlsSessionCache, TlsSessionCache},
-        trust::{CertStore, Identity},
+        trust::{AiaCache, CertStore, Identity},
     },
 };
 
@@ -149,7 +151,18 @@ type BoxedClientServiceLayer = BoxCloneSyncServiceLayer<
 ///
 /// [`Rc`]: std::rc::Rc
 #[derive(Clone)]
-pub struct Client(Arc<Either<ClientService, BoxedClientService>>);
+pub struct Client(
+    Arc<Either<ClientService, BoxedClientService>>,
+    Arc<Connections>,
+);
+
+/// The TLS connector and connection pool behind a [`Client`]'s requests, for connections
+/// opened outside one.
+struct Connections {
+    tls: TlsConnector,
+    #[cfg(feature = "tokio-rt")]
+    http: HttpClient<Connector, Body>,
+}
 
 /// A [`ClientBuilder`] can be used to create a [`Client`] with custom configuration.
 #[must_use]
@@ -215,11 +228,13 @@ struct Config {
     tls_identity: Option<Identity>,
     tls_cert_store: Option<CertStore>,
     tls_cert_verification: bool,
+    tls_aia: Option<AiaCache>,
     tls_verify_hostname: bool,
     tls_min_version: Option<TlsVersion>,
     tls_max_version: Option<TlsVersion>,
     tls_session_cache: Option<Arc<dyn TlsSessionCache>>,
     tls_options: Option<TlsOptions>,
+    tls_connector: Option<TlsConnector>,
     http1_options: Option<Http1Options>,
     http2_options: Option<Http2Options>,
     timer: Timer,
@@ -304,10 +319,12 @@ impl Client {
                 tls_identity: None,
                 tls_cert_store: None,
                 tls_cert_verification: true,
+                tls_aia: None,
                 tls_verify_hostname: true,
                 tls_min_version: None,
                 tls_max_version: None,
                 tls_session_cache: None,
+                tls_connector: None,
                 tls_options: None,
                 timer: Timer::default(),
                 executor: Executor::default(),
@@ -428,6 +445,46 @@ impl Client {
             fut: Box::pin(Oneshot::new((*self.0).clone(), req)),
         }
     }
+
+    /// Opens a TLS connection over `io` as `request`'s own connection would open, offering
+    /// its ALPN protocols only with `alpn` (see [`RequestBuilder::tls_connect`]).
+    #[cfg(feature = "tokio-rt")]
+    pub(crate) async fn tls_connect<IO>(
+        &self,
+        request: Request,
+        io: IO,
+        alpn: bool,
+    ) -> crate::Result<TlsStream<IO>>
+    where
+        IO: AsyncRead + AsyncWrite + Unpin,
+    {
+        let gate = request.extensions().get::<crate::tls::AlpsGate>().cloned();
+        let descriptor = self
+            .1
+            .http
+            .descriptor(http::Request::<Body>::from(request))
+            .map_err(Error::request)?;
+        if descriptor.tls_options().is_some() {
+            return Err(Error::tls(
+                "a request with TLS options of its own opens no raw TLS connection",
+            ));
+        }
+        self.1
+            .tls
+            .connect(io, &descriptor, alpn, gate)
+            .await
+            .map_err(Error::tls)
+    }
+
+    /// Adopts `request`'s offered connection into the pool (see [`RequestBuilder::adopt`]).
+    #[cfg(feature = "tokio-rt")]
+    pub(crate) async fn adopt(&self, request: Request) -> crate::Result<()> {
+        self.1
+            .http
+            .adopt(http::Request::<Body>::from(request))
+            .await
+            .map_err(Error::request)
+    }
 }
 
 impl tower::Service<Request> for Client {
@@ -484,7 +541,7 @@ impl ClientBuilder {
         }
 
         // Create base client service
-        let service = {
+        let (service, connections) = {
             let resolver = {
                 let mut resolver: Arc<dyn Resolve> = match config.dns_resolver {
                     Some(dns_resolver) => dns_resolver,
@@ -502,7 +559,7 @@ impl ClientBuilder {
                 DynResolver::new(resolver)
             };
 
-            let connector = Connector::builder(config.proxies, resolver)
+            let (connector, tls) = Connector::builder(config.proxies, resolver)
                 .timeout(config.connect_timeout)
                 .tls_info(config.tls_info)
                 .tcp_nodelay(config.tcp_nodelay)
@@ -521,6 +578,7 @@ impl ClientBuilder {
                     .tls_sni(config.tls_sni)
                     .verify_hostname(config.tls_verify_hostname)
                     .cert_verification(config.tls_cert_verification)
+                    .aia(config.tls_aia)
                     .session_store(config.tls_session_cache)
                 })
                 .with_http(|http| {
@@ -560,7 +618,11 @@ impl ClientBuilder {
                         config.socket_bind_options.ipv6_address,
                     );
                 })
-                .build(config.tls_options, config.connector_layers)?;
+                .build(
+                    config.tls_options,
+                    config.tls_connector,
+                    config.connector_layers,
+                )?;
 
             #[allow(unused_mut)]
             let mut builder = HttpClient::builder(config.executor);
@@ -570,7 +632,7 @@ impl ClientBuilder {
                 builder = builder.cookie_store(config.cookie_store);
             }
 
-            builder
+            let service = builder
                 .http1_options(config.http1_options)
                 .http2_options(config.http2_options)
                 .http2_only(matches!(config.http_version_pref, HttpVersionPref::Http2))
@@ -579,7 +641,13 @@ impl ClientBuilder {
                 .pool_idle_timeout(config.pool_idle_timeout)
                 .pool_max_idle_per_host(config.pool_max_idle_per_host)
                 .pool_max_size(config.pool_max_size)
-                .build(connector)
+                .build(connector);
+            let connections = Connections {
+                tls,
+                #[cfg(feature = "tokio-rt")]
+                http: service.clone(),
+            };
+            (service, connections)
         };
 
         // Configured client service with layers
@@ -635,7 +703,7 @@ impl ClientBuilder {
             }
         };
 
-        Ok(Client(Arc::new(client)))
+        Ok(Client(Arc::new(client), Arc::new(connections)))
     }
 
     // Runtime options
@@ -1446,6 +1514,16 @@ impl ClientBuilder {
         self
     }
 
+    /// Completes certificate chains missing an issuer with the issuers `cache` fetches from
+    /// the caIssuers URLs of the certificates lacking one, as browsers do (see [`AiaCache`]).
+    ///
+    /// Off by default. It applies only with certificate verification.
+    #[inline]
+    pub fn tls_aia(mut self, cache: AiaCache) -> ClientBuilder {
+        self.config.tls_aia = Some(cache);
+        self
+    }
+
     /// Configures the use of hostname verification when connecting.
     ///
     /// Defaults to `true`.
@@ -1512,6 +1590,16 @@ impl ClientBuilder {
     #[inline]
     pub fn tls_session_cache<S: IntoTlsSessionCache>(mut self, store: S) -> ClientBuilder {
         self.config.tls_session_cache = Some(store.into_shared());
+        self
+    }
+
+    /// Opens this client's TLS connections with `client`'s TLS connector — its ClientHello,
+    /// trust, client identity and TLS sessions — instead of one built from this builder's
+    /// TLS settings, so either client can adopt a connection the other opened (see
+    /// [`RequestBuilder::adopt`]).
+    #[inline]
+    pub fn tls_connector_of(mut self, client: &Client) -> ClientBuilder {
+        self.config.tls_connector = Some(client.1.tls.clone());
         self
     }
 

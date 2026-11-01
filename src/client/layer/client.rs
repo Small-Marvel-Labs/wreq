@@ -2,33 +2,37 @@
 
 mod lazy;
 mod pool;
+mod scoped;
 
 use std::{
     error::Error as StdError,
     fmt,
     future::Future,
     num::NonZeroUsize,
+    pin::Pin,
     task::{self, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
 use futures_util::future::{self, BoxFuture, Either, FutureExt, TryFutureExt};
 use http::{
     HeaderValue, Method, Request, Response, Uri, Version,
-    header::{HOST, PROXY_AUTHORIZATION},
+    header::{CONNECTION, HOST, PROXY_AUTHORIZATION, TRANSFER_ENCODING},
     uri::{Authority, PathAndQuery, Scheme},
 };
 use http_body::Body;
+use http2::ext::{HeadersFrameOptions, RecordedStream};
 use pool::Ver;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tower::{BoxError, util::Oneshot};
 use wreq_proto::{
     body::Incoming,
     conn::{self, TrySendError as ConnTrySendError},
+    ext::OnTaken,
     http1::Http1Options,
     http2::Http2Options,
-    rt::Executor as _,
+    rt::{Executor as _, Sleep, Timer as _},
 };
 #[cfg(feature = "cookies")]
 use {
@@ -37,9 +41,15 @@ use {
     std::sync::Arc,
 };
 
-use self::lazy::{Started as Lazy, lazy};
+use self::{
+    lazy::{Started as Lazy, lazy},
+    scoped::{Abort, Dropped, EndedFirst, ScopedIo},
+};
 use crate::{
-    client::layer::config::RequestOptions,
+    client::{
+        body::{READ_AHEAD_WAIT, ReadAhead, ReadAheadOnHttp1},
+        layer::config::RequestOptions,
+    },
     config::RequestConfig,
     conn::{
         Connected, Connection,
@@ -47,6 +57,7 @@ use crate::{
         proxy,
     },
     error::ProxyConnect,
+    group::{ConnectionEnd, Http1Open, OnOriginEnd, OnQueued, OriginEnd, ScopeEnded, ScopeRef},
     rt::{Executor, Timer},
 };
 
@@ -59,6 +70,7 @@ pub(crate) struct HttpClient<C, B> {
     config: Config,
     connector: C,
     exec: Executor,
+    timer: Timer,
     h1_builder: conn::http1::Builder,
     h2_builder: conn::http2::Builder<Executor>,
     pool: pool::Pool<PoolClient<B>, ConnectionId>,
@@ -141,7 +153,7 @@ where
     C::Response: AsyncRead + AsyncWrite + Connection + Unpin + Send + 'static,
     C::Error: Into<BoxError>,
     C::Future: Unpin + Send + 'static,
-    B: Body + Send + 'static + Unpin,
+    B: Body + ReadAhead + Send + 'static + Unpin,
     B::Data: Send,
     B::Error: Into<BoxError>,
 {
@@ -149,41 +161,73 @@ where
         &self,
         mut req: Request<B>,
     ) -> BoxFuture<'static, Result<Response<Incoming>, BoxError>> {
+        match self.prepare(&mut req) {
+            Ok((this, descriptor)) => {
+                Box::pin(this.send_request(req, descriptor).map_err(Into::into))
+            }
+            Err(err) => Box::pin(future::err(err.into())),
+        }
+    }
+
+    /// Adopts the connection `req` offers (see
+    /// [`RequestBuilder::adopt`](crate::RequestBuilder::adopt)) into the pool as an idle
+    /// connection of the connections `req` would use, without sending `req`.
+    #[cfg(feature = "tokio-rt")]
+    pub(crate) async fn adopt(&self, mut req: Request<B>) -> Result<(), Error> {
+        let (this, descriptor) = self.prepare(&mut req)?;
+        // Dropping the ready connection puts it in the pool.
+        drop(this.connection_for(descriptor).await?);
+        Ok(())
+    }
+
+    /// The connection `req` needs.
+    #[cfg(feature = "tokio-rt")]
+    pub(crate) fn descriptor(&self, mut req: Request<B>) -> Result<ConnectionDescriptor, Error> {
+        self.prepare(&mut req).map(|(_, descriptor)| descriptor)
+    }
+
+    /// This client with `req`'s per-request options applied, and the connection `req`
+    /// needs.
+    fn prepare(&self, req: &mut Request<B>) -> Result<(Self, ConnectionDescriptor), Error> {
         let is_http_connect = req.method() == Method::CONNECT;
         // Validate HTTP version early
         match req.version() {
             Version::HTTP_10 if is_http_connect => {
                 warn!("CONNECT is not allowed for HTTP/1.0");
-                return Box::pin(future::err(e!(UserUnsupportedRequestMethod).into()));
+                return Err(e!(UserUnsupportedRequestMethod));
             }
             Version::HTTP_10 | Version::HTTP_11 | Version::HTTP_2 => {}
             // completely unsupported HTTP version (like HTTP/0.9)!
             _unsupported => {
                 warn!("Request has unsupported version: {:?}", _unsupported);
-                return Box::pin(future::err(e!(UserUnsupportedVersion).into()));
+                return Err(e!(UserUnsupportedVersion));
             }
         };
 
         // Extract and normalize URI
-        let uri = match normalize_uri(&mut req, is_http_connect) {
-            Ok(uri) => uri,
-            Err(err) => {
-                return Box::pin(future::err(e!(UserAbsoluteUriRequired, err).into()));
-            }
-        };
+        let uri =
+            normalize_uri(req, is_http_connect).map_err(|err| e!(UserAbsoluteUriRequired, err))?;
 
         let mut this = self.clone();
 
         // Extract per-request options from the request extensions and apply them to the client.
         let descriptor = {
             let RequestOptions {
-                group,
+                mut group,
                 proxy,
                 version,
                 tls_options,
                 http1_options,
                 http2_options,
                 socket_bind_options,
+                tls_server_name,
+                tls_verify_name,
+                accepted_certificate,
+                min_dhe_bits,
+                scope,
+                connect_to,
+                #[cfg(feature = "tokio-rt")]
+                preconnected,
             } = RequestConfig::<RequestOptions>::remove(req.extensions_mut()).unwrap_or_default();
 
             if let Some(opts) = http1_options {
@@ -193,10 +237,49 @@ where
                 this.h2_builder = this.h2_builder.options(opts);
             }
 
-            ConnectionDescriptor::new(uri, group, proxy, version, tls_options, socket_bind_options)
+            // The name TLS verifies and whether it announces it: the request's own unless it
+            // names another (only to verify, when it announces none), also on a connection
+            // opened to another authority.
+            let host = uri.host().unwrap_or_default();
+            let tls_name = match tls_server_name {
+                Some(Some(name)) => Some((name, true)),
+                Some(None) => {
+                    group.verify_name(tls_verify_name.clone());
+                    Some((tls_verify_name.unwrap_or_else(|| Box::from(host)), false))
+                }
+                None => connect_to.is_some().then(|| (Box::from(host), true)),
+            };
+            if let Some((name, sni)) = &tls_name {
+                group.server_name(sni.then(|| name.clone()));
+            }
+            group.accepted_certificate(accepted_certificate);
+            let uri = match connect_to {
+                Some(authority) => {
+                    let mut parts = uri.into_parts();
+                    parts.authority = Some(authority);
+                    Uri::from_parts(parts).expect("valid base URI")
+                }
+                None => uri,
+            };
+
+            let descriptor = ConnectionDescriptor::new(
+                uri,
+                group,
+                scope,
+                proxy,
+                version,
+                tls_options,
+                socket_bind_options,
+            )
+            .with_tls_name(tls_name)
+            .with_accepted_certificate(accepted_certificate)
+            .with_min_dhe_bits(min_dhe_bits);
+            #[cfg(feature = "tokio-rt")]
+            let descriptor = descriptor.with_preconnected(preconnected);
+            descriptor
         };
 
-        Box::pin(this.send_request(req, descriptor).map_err(Into::into))
+        Ok((this, descriptor))
     }
 
     async fn send_request(
@@ -238,6 +321,7 @@ where
         mut req: Request<B>,
         descriptor: ConnectionDescriptor,
     ) -> Result<Response<Incoming>, TrySendError<B>> {
+        let scope = descriptor.scope().cloned();
         let mut pooled = self
             .connection_for(descriptor)
             .await
@@ -255,7 +339,7 @@ where
                 ));
             }
 
-            if self.config.set_host {
+            if self.config.set_host && req.extensions().get::<NoHostOnHttp1>().is_none() {
                 req.headers_mut()
                     .entry(HOST)
                     .or_insert_with(|| generate_host_header(&uri));
@@ -281,6 +365,20 @@ where
             }
         } else if req.method() == Method::CONNECT && !pooled.is_http2() {
             authority_form(req.uri_mut());
+        }
+
+        if pooled.is_http1() && req.extensions_mut().remove::<ReadAheadOnHttp1>().is_some() {
+            // The connection is the request's alone, which it is told before its body is read
+            // ahead; it is queued once the connection took it.
+            if let Some(on_queued) = req.extensions().get::<OnQueued>() {
+                on_queued.queued_alone();
+            }
+            let (mut parts, body) = req.into_parts();
+            let body = body.read_ahead(self.timer.sleep(READ_AHEAD_WAIT)).await;
+            if body.is_end_stream() {
+                parts.headers.remove(TRANSFER_ENCODING);
+            }
+            req = Request::from_parts(parts, body);
         }
 
         #[cfg(feature = "cookies")]
@@ -311,24 +409,66 @@ where
             }
         }
 
-        let mut res = match pooled.try_send_request(req).await {
+        let mut on_queued = req.extensions().get::<OnQueued>().cloned();
+        let on_origin_end = pooled
+            .last
+            .as_ref()
+            .and(req.extensions().get::<OnOriginEnd>().cloned());
+        // An HTTP/1 connection drops a request its sender dropped before it took the request
+        // to write, unwritten: the request is queued on it, and the last it took, only once
+        // taken.
+        if pooled.is_http1() && (on_queued.is_some() || pooled.last.is_some()) {
+            let (on_queued, last, on_origin_end) =
+                (on_queued.take(), pooled.last.clone(), on_origin_end.clone());
+            req.extensions_mut().insert(OnTaken::new(move || {
+                if let Some(last) = &last {
+                    last.lock().clone_from(&on_origin_end);
+                }
+                if let Some(on_queued) = &on_queued {
+                    on_queued.queued();
+                }
+            }));
+        }
+        let _expected = pooled.expect_request(&req);
+        let request_close = lists(req.headers(), "close")
+            || req.version() == Version::HTTP_10 && !lists(req.headers(), "keep-alive");
+        let sent = pooled.try_send_request(req);
+        if let Some(on_queued) = on_queued {
+            on_queued.queued();
+        }
+        let mut res = match sent.await {
             Ok(res) => res,
             Err(mut err) => {
                 return if let Some(req) = err.take_message() {
                     Err(TrySendError::Retryable {
                         connection_reused: pooled.is_reused(),
                         error: Error::new(ErrorKind::Canceled, err.into_error())
+                            .ended_by(&pooled.ended_first)
                             .with_connect_info(pooled.conn_info.clone()),
                         req,
                     })
                 } else {
                     Err(TrySendError::Nope(
                         Error::new(ErrorKind::SendRequest, err.into_error())
+                            .ended_by(&pooled.ended_first)
                             .with_connect_info(pooled.conn_info.clone()),
                     ))
                 };
             }
         };
+
+        // Its origin closes the connection after this exchange.
+        if let Some(scope) = &scope
+            && pooled.is_http1()
+            && (request_close
+                || lists(res.headers(), "close")
+                || res.version() == Version::HTTP_10 && !lists(res.headers(), "keep-alive"))
+        {
+            scope.expect_http1_origin_close();
+            if let Some(on_origin_end) = &on_origin_end {
+                on_origin_end.closing();
+            }
+        }
 
         #[cfg(feature = "cookies")]
         if let Some(cookie_store) = cookie_store {
@@ -401,6 +541,13 @@ where
                 .connect_to(descriptor)
                 .await
                 .map_err(ClientConnectError::Normal);
+        }
+
+        if let Some(pooled) = descriptor
+            .unversioned_id()
+            .and_then(|id| self.pool.checkout_unshared(id))
+        {
+            return Ok(pooled);
         }
 
         // This actually races 2 different futures to try to get a ready
@@ -490,6 +637,7 @@ where
     + Unpin
     + 'static {
         let executor = self.exec.clone();
+        let timer = self.timer.clone();
         let pool = self.pool.clone();
 
         let h1_builder = self.h1_builder.clone();
@@ -500,7 +648,18 @@ where
         };
         let is_ver_h2 = ver == Ver::Http2;
         let connector = self.connector.clone();
+        let scope = descriptor.scope().cloned();
         lazy(move || {
+            if scope.as_ref().is_some_and(ScopeRef::http1_origin_gone) {
+                let gone = std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "the origin closed the scope's last HTTP/1 connection",
+                );
+                return Either::Right(futures_util::future::err(Error::new(
+                    ErrorKind::Connect,
+                    gone,
+                )));
+            }
             // Try to take a "connecting lock".
             //
             // If the pool_key is for HTTP/2, and there is already a
@@ -513,8 +672,20 @@ where
                     return Either::Right(futures_util::future::err(e!(Canceled)));
                 }
             };
+            let http1 = scope
+                .as_ref()
+                .filter(|_| !is_ver_h2)
+                .map(ScopeRef::http1_opened);
+            let abandoned = Box::pin(abandoned(scope.clone(), timer.clone()));
             Either::Left(
-                Oneshot::new(connector, descriptor)
+                future::select(Oneshot::new(connector, descriptor), abandoned)
+                    .map(|raced| match raced {
+                        Either::Left((connected, _)) => connected.map_err(Into::into),
+                        Either::Right(_) => Err(Box::new(ScopeEnded(Box::new(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionAborted,
+                            "the connection's scope ended before it was set up",
+                        )))) as BoxError),
+                    })
                     .map_err(|src| Error::new(ErrorKind::Connect, src))
                     .and_then(move |io| {
                         let connected = io.connected();
@@ -541,18 +712,37 @@ where
                         let is_h2 = is_ver_h2 || connected.is_negotiated_h2();
 
                         Either::Left(Box::pin(async move {
+                            let in_scope = scope.is_some();
+                            let last = http1.as_ref().filter(|_| !is_h2).map(Http1Open::last);
+                            let (io, dropped) =
+                                ScopedIo::new(io, scope.clone(), http1, is_h2, timer.clone());
+                            let abort = io.abort();
+                            let ended_first = io.ended_first();
                             let tx = if is_h2 {
                                {
-                                    let (mut tx, conn) =
-                                        h2_builder.handshake(io).await.map_err(Error::tx)?;
+                                    let (sending, finishes) = io.sending_bodies();
+                                    let (mut tx, conn) = h2_builder
+                                        .sending_bodies(sending, finishes)
+                                        .handshake(io)
+                                        .await
+                                        .map_err(Error::tx)?;
 
                                     trace!(
                                         "http2 handshake complete, spawning background dispatcher task"
                                     );
-                                    executor.execute(
+                                    let registration = scope
+                                        .as_ref()
+                                        .map(|scope| scope.register_http2(tx.control().clone()));
+                                    executor.execute(scoped(
                                         conn.map_err(|_e| debug!("client connection error: {}", _e))
-                                            .map(|_| ()),
-                                    );
+                                            .map(move |_| drop(registration)),
+                                        scope,
+                                        dropped,
+                                        abort,
+                                        std::sync::Arc::clone(&ended_first),
+                                        true,
+                                        timer,
+                                    ));
 
                                     // Wait for 'conn' to ready up before we
                                     // declare this tx as usable
@@ -564,14 +754,21 @@ where
                                     // Perform the HTTP/1.1 handshake on the provided I/O stream. More actions
                                     // Uses the h1_builder to establish a connection, returning a sender (tx) for requests
                                     // and a connection task (conn) that manages the connection lifecycle.
-                                    let (mut tx, conn) =
-                                        h1_builder.handshake(io).await.map_err(Error::tx)?;
+                                    let sending_body = io.sending_body();
+                                    let (mut tx, conn) = h1_builder
+                                        .sending_body(sending_body)
+                                        .handshake(io)
+                                        .await
+                                        .map_err(Error::tx)?;
 
                                     // Log that the HTTP/1.1 handshake has completed successfully.
                                     // This indicates the connection is established and ready for request processing.
                                     trace!(
                                         "http1 handshake complete, spawning background dispatcher task"
                                     );
+                                    if let Some(scope) = &scope {
+                                        scope.opened_http1();
+                                    }
 
                                     // Create a oneshot channel to communicate errors from the connection task.
                                     // err_tx sends errors from the connection task, and err_rx receives them
@@ -580,7 +777,7 @@ where
                                     // Spawn the connection task in the background using the executor.
                                     // The task manages the HTTP/1.1 connection, including upgrades (e.g., WebSocket).
                                     // Errors are sent via err_tx to ensure they can be checked if the sender (tx) fails.
-                                    executor.execute(
+                                    executor.execute(scoped(
                                         conn.with_upgrades()
                                                 .map_err(|e| {
                                                 // Log the connection error at debug level for diagnostic purposes.
@@ -592,7 +789,13 @@ where
                                                 let _ = err_tx.send(e);
                                             })
                                             .map(|_| ()),
-                                    );
+                                        scope,
+                                        dropped,
+                                        abort,
+                                        std::sync::Arc::clone(&ended_first),
+                                        false,
+                                        timer,
+                                    ));
 
                                     // Log that the client is waiting for the connection to be ready.
                                     // Readiness indicates the sender (tx) can accept a request without blocking. More actions
@@ -654,6 +857,9 @@ where
                                 PoolClient {
                                     conn_info: connected,
                                     tx,
+                                    scoped: in_scope,
+                                    ended_first,
+                                    last,
                                 },
                             ))
                         }))
@@ -669,7 +875,7 @@ where
     C::Response: AsyncRead + AsyncWrite + Connection + Unpin + Send + 'static,
     C::Error: Into<BoxError>,
     C::Future: Unpin + Send + 'static,
-    B: Body + Send + 'static + Unpin,
+    B: Body + ReadAhead + Send + 'static + Unpin,
     B::Data: Send,
     B::Error: Into<BoxError>,
 {
@@ -691,6 +897,7 @@ impl<C: Clone, B> Clone for HttpClient<C, B> {
         HttpClient {
             config: self.config,
             exec: self.exec.clone(),
+            timer: self.timer.clone(),
             h1_builder: self.h1_builder.clone(),
             h2_builder: self.h2_builder.clone(),
             connector: self.connector.clone(),
@@ -705,6 +912,11 @@ impl<C: Clone, B> Clone for HttpClient<C, B> {
 struct PoolClient<B> {
     conn_info: Connected,
     tx: PoolTx<B>,
+    /// Whether it is confined to a scope, which closes it.
+    scoped: bool,
+    ended_first: std::sync::Arc<EndedFirst>,
+    /// Where a scoped HTTP/1 one keeps the [`OnOriginEnd`] of the request it took last.
+    last: Option<std::sync::Arc<crate::sync::Mutex<Option<OnOriginEnd>>>>,
 }
 
 enum PoolTx<B> {
@@ -726,6 +938,28 @@ impl<B> PoolClient<B> {
     #[inline]
     fn is_http1(&self) -> bool {
         !self.is_http2()
+    }
+
+    /// Tells a scoped HTTP/2 connection that `req`, a request of its scope's client recorded
+    /// as it numbered it, is on its way to it, until sent there or the value returned is
+    /// dropped (see [`Control::expect_request`](http2::client::Control::expect_request)).
+    fn expect_request<T>(&self, req: &Request<T>) -> Option<http2::client::ExpectedRequest> {
+        let PoolTx::Http2(tx) = &self.tx else {
+            return None;
+        };
+        if !self.scoped {
+            return None;
+        }
+        let extensions = req.extensions();
+        let recorded = extensions
+            .get::<HeadersFrameOptions>()
+            .and_then(|options| options.recorded_stream_id)
+            .or_else(|| {
+                extensions
+                    .get::<RecordedStream>()
+                    .map(|recorded| recorded.0)
+            })?;
+        Some(tx.control().expect_request(recorded))
     }
 
     #[inline]
@@ -781,16 +1015,25 @@ where
             PoolTx::Http1(tx) => pool::Reservation::Unique(PoolClient {
                 conn_info: self.conn_info,
                 tx: PoolTx::Http1(tx),
+                scoped: self.scoped,
+                ended_first: self.ended_first,
+                last: self.last,
             }),
 
             PoolTx::Http2(tx) => {
                 let b = PoolClient {
                     conn_info: self.conn_info.clone(),
                     tx: PoolTx::Http2(tx.clone()),
+                    scoped: self.scoped,
+                    ended_first: std::sync::Arc::clone(&self.ended_first),
+                    last: None,
                 };
                 let a = PoolClient {
                     conn_info: self.conn_info,
                     tx: PoolTx::Http2(tx),
+                    scoped: self.scoped,
+                    ended_first: self.ended_first,
+                    last: None,
                 };
                 pool::Reservation::Shared(a, b)
             }
@@ -800,6 +1043,11 @@ where
     #[inline]
     fn can_share(&self) -> bool {
         self.is_http2()
+    }
+
+    #[inline]
+    fn outlives_idle_timeout(&self) -> bool {
+        self.scoped
     }
 }
 
@@ -957,6 +1205,7 @@ impl Builder {
         HttpClient {
             config: self.config,
             exec: exec.clone(),
+            timer: timer.clone(),
             connector,
             h1_builder: self.h1_builder,
             h2_builder: self.h2_builder,
@@ -1034,6 +1283,17 @@ impl Error {
         matches!(self.kind, ErrorKind::Canceled)
     }
 
+    /// It, its source a [`ScopeEnded`] should its connection's scope have ended that
+    /// connection before its origin did (see [`EndedFirst`]).
+    fn ended_by(mut self, ended_first: &EndedFirst) -> Self {
+        if ended_first.by_scope() {
+            self.source = self
+                .source
+                .map(|source| Box::new(ScopeEnded(source)) as BoxError);
+        }
+        self
+    }
+
     #[inline]
     fn tx(src: wreq_proto::Error) -> Self {
         Self::new(ErrorKind::SendRequest, src)
@@ -1043,6 +1303,277 @@ impl Error {
     fn closed(src: wreq_proto::Error) -> Self {
         Self::new(ErrorKind::ChannelClosed, src)
     }
+}
+
+/// How long an HTTP/1 connection whose scope ended gets to close its transport.
+const SCOPED_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// What bounds, by `timer`, the drain of a scoped connection starting now: its scope's
+/// `deadline`, if any (see [`crate::ConnectionScope::drain_until`]), else
+/// [`SCOPED_CLOSE_TIMEOUT`].
+fn drain_bound(timer: &Timer, deadline: Option<Instant>) -> Pin<Box<dyn Sleep>> {
+    match deadline {
+        Some(deadline) => timer.sleep_until(deadline),
+        None => timer.sleep(SCOPED_CLOSE_TIMEOUT),
+    }
+}
+
+/// Resolves once a connection still being set up for `scope`, if any, is to be given up, as
+/// an open one would end: at once as its scope ends with a reset, else once its scope is
+/// closed, by the bound of its end (see [`drain_bound`]), its connect (its TLS handshake,
+/// say) dropped then, whether a request still waits for it or the pool's checkout won.
+async fn abandoned(scope: Option<ScopeRef>, timer: Timer) {
+    let Some(scope) = scope else {
+        return future::pending().await;
+    };
+    let closed = async {
+        scope.clone().closed().await;
+        if scope.drains() {
+            drain_bound(&timer, scope.drain_deadline()).await;
+        }
+    };
+    future::select(std::pin::pin!(reset(&scope)), std::pin::pin!(closed)).await;
+}
+
+/// Resolves once `scope` ends with a reset.
+async fn reset(scope: &ScopeRef) {
+    struct Waiting<'a>(&'a ScopeRef, u64);
+    impl Drop for Waiting<'_> {
+        fn drop(&mut self) {
+            self.0.forget(self.1);
+        }
+    }
+    let waiting = Waiting(scope, scoped::next_id());
+    future::poll_fn(|cx| {
+        if scope.wake_on_reset(waiting.1, cx.waker()) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
+}
+
+/// How long an HTTP/1 connection done before its origin ended it reads for that end: the
+/// origin of an exchange that said `Connection: close` ends it right after.
+const ORIGIN_END_WAIT: Duration = Duration::from_secs(2);
+
+/// Drives a connection until it ends or, for a scoped connection, its scope does, one whose
+/// scope drains then still getting [`SCOPED_CLOSE_TIMEOUT`], or until its scope's deadline (see
+/// [`crate::ConnectionScope::drain_until`]), to send what it holds, an HTTP/2
+/// one its request bodies, should they finish (see [`ScopedIo`]). An HTTP/1 connection whose scope
+/// ends gracefully (see [`ConnectionEnd`]) then closes its transport, back once the connection
+/// dropped it (`dropped`), as a client done with it does; an HTTP/2 one (`http2`) closes so
+/// itself, aborted (`abort`) should it still hold its transport past its scope's close by that
+/// bound. One whose scope ended with a FIN or
+/// gracefully then reads until its origin closes too (see [`close`]). One back owing its origin
+/// its scope's alert sends it (see [`send_alert`]), an upgraded one once its transport is
+/// dropped. They do so by that bound too, an upgraded one, which outlived its scope's end,
+/// within [`SCOPED_CLOSE_TIMEOUT`] by `timer`. An HTTP/1 one done
+/// first, back still counted open in its scope (see [`ScopedIo`]), is counted closed as its
+/// origin then ends it, or, past [`ORIGIN_END_WAIT`], as closed by the client.
+async fn scoped<T: AsyncRead + AsyncWrite + Connection + Unpin>(
+    conn: impl Future<Output = ()>,
+    scope: Option<ScopeRef>,
+    mut dropped: tokio::sync::oneshot::Receiver<Dropped<T>>,
+    abort: std::sync::Arc<Abort>,
+    ended_first: std::sync::Arc<EndedFirst>,
+    http2: bool,
+    timer: Timer,
+) {
+    let Some(scope) = scope else {
+        return conn.await;
+    };
+    let mut bound = None;
+    let ended = {
+        let mut conn = std::pin::pin!(conn);
+        let closed = std::pin::pin!(scope.clone().closed());
+        match future::select(conn.as_mut(), closed).await {
+            Either::Left(_) => true,
+            Either::Right(_) => {
+                let bound = bound.insert(drain_bound(&timer, scope.drain_deadline()));
+                let done = scope.drains()
+                    && (!http2 || scope.finishes())
+                    && matches!(future::select(conn, bound.as_mut()).await, Either::Left(_));
+                // Dropped undone, it fails the requests it still has as its scope ended it.
+                if !done {
+                    ended_first.scope();
+                }
+                false
+            }
+        }
+    };
+    // Upgraded, its transport lives on, as an HTTP/2 one's may a while: back once dropped,
+    // an HTTP/2 one's aborted past its scope's close by the bound of its end.
+    let (upgraded, dropped) = match dropped.try_recv() {
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty) if http2 => {
+            let aborts = std::pin::pin!(async {
+                scope.clone().closed().await;
+                let deadline = scope.drain_deadline();
+                bound
+                    .get_or_insert_with(|| drain_bound(&timer, deadline))
+                    .await;
+            });
+            let back = match future::select(&mut dropped, aborts).await {
+                Either::Left((back, _)) => back,
+                Either::Right(_) => {
+                    abort.abort();
+                    dropped.await
+                }
+            };
+            (false, back.ok())
+        }
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => (ended, dropped.await.ok()),
+        dropped => (false, dropped.ok()),
+    };
+    let Some((mut io, open, alert, shut)) = dropped else {
+        return;
+    };
+    let bound = || match bound {
+        Some(bound) => bound,
+        None if upgraded => timer.sleep(SCOPED_CLOSE_TIMEOUT),
+        None => drain_bound(&timer, scope.drain_deadline()),
+    };
+    let ending = async {
+        match (alert, open) {
+            (Some(alert), _) => send_alert(&mut io, alert, bound()).await,
+            // Its relay done, it closes as its client did, which half-closed with a FIN alone.
+            (None, _) if upgraded => {
+                if scope.half_closes_with_fin() {
+                    close(&mut io, shut, ConnectionEnd::Fin, bound()).await;
+                }
+            }
+            (None, Some(open)) if ended => {
+                let end = std::pin::pin!(origin_end(&mut io, open));
+                future::select(timer.sleep(ORIGIN_END_WAIT), end).await;
+            }
+            (None, _) if shut || !ended || scope.ended().is_some() => {
+                close(&mut io, shut, scope.end(), bound()).await
+            }
+            _ => {}
+        }
+    };
+    // Its scope reset meanwhile, it resets at once, as it would have before it was back.
+    let was_reset = matches!(
+        future::select(std::pin::pin!(reset(&scope)), std::pin::pin!(ending)).await,
+        Either::Left(_)
+    );
+    if was_reset {
+        scoped::reset_when_dropped(&io);
+    }
+}
+
+/// Closes `io`, the transport of a scoped connection whose scope ended as `end` says, unless
+/// it was (`shut`), then reads what its origin still sends, dropping it, until the origin
+/// closes too, within `bound`, as a client half-closing its own
+/// connection does: dropped at once, it would answer what the origin still sends, the
+/// response to a request it sent last say, with a reset. One ending otherwise just closes.
+async fn close<T: AsyncRead + AsyncWrite + Connection + Unpin>(
+    io: &mut T,
+    shut: bool,
+    end: ConnectionEnd,
+    bound: Pin<Box<dyn Sleep>>,
+) {
+    if !matches!(end, ConnectionEnd::Fin | ConnectionEnd::Graceful) {
+        return;
+    }
+    let ending = |io: Pin<&mut T>, cx: &mut task::Context<'_>| -> Poll<std::io::Result<()>> {
+        match end {
+            _ if shut => Poll::Ready(Ok(())),
+            ConnectionEnd::Graceful => io.poll_shutdown(cx),
+            _ => Poll::Ready(
+                io.socket()
+                    .ok_or(std::io::ErrorKind::Unsupported)?
+                    .shutdown(std::net::Shutdown::Write),
+            ),
+        }
+    };
+    match end_scoped(io, ending, bound).await {
+        None => debug!("closing a scoped connection timed out"),
+        Some(Ok(())) => {}
+        Some(Err(_e)) => debug!("closing a scoped connection failed: {}", _e),
+    }
+}
+
+/// Sends `alert`, the fatal alert a scoped connection over `io` owes its origin, as its
+/// origin reads what was sent before it, then its FIN, then reads what its origin still sends,
+/// dropping it, until the origin closes too, within `bound`, as [`close`] does: dropped at
+/// once, it would answer what the origin still sends, the session tickets and SETTINGS of a
+/// connection it just opened say, with a reset, which may cost the origin the alert, or the
+/// request sent before it.
+async fn send_alert<T: AsyncRead + Connection + Unpin>(
+    io: &mut T,
+    alert: u8,
+    bound: Pin<Box<dyn Sleep>>,
+) {
+    let ending = |mut io: Pin<&mut T>, cx: &mut task::Context<'_>| -> Poll<std::io::Result<()>> {
+        std::task::ready!(io.as_mut().poll_send_fatal_alert(cx, alert))?;
+        Poll::Ready(
+            io.socket()
+                .ok_or(std::io::ErrorKind::Unsupported)?
+                .shutdown(std::net::Shutdown::Write),
+        )
+    };
+    match end_scoped(io, ending, bound).await {
+        None => debug!("alerting a scoped connection timed out"),
+        Some(Ok(())) => {}
+        Some(Err(_e)) => debug!("alerting a scoped connection failed: {}", _e),
+    }
+}
+
+/// Ends `io`, the transport of a scoped connection, with what it owes its origin (`end`: its
+/// alert, close_notify or FIN), written even past `bound`, which gives it up only should it
+/// wait for room, then reads what its origin still sends, dropping it, until the origin closes
+/// too, within `bound`: `None` past it.
+async fn end_scoped<T: AsyncRead + Unpin>(
+    io: &mut T,
+    mut end: impl FnMut(Pin<&mut T>, &mut task::Context<'_>) -> Poll<std::io::Result<()>>,
+    mut bound: Pin<Box<dyn Sleep>>,
+) -> Option<std::io::Result<()>> {
+    use tokio::io::AsyncReadExt;
+
+    let ended = future::poll_fn(|cx| end(Pin::new(&mut *io), cx));
+    match future::select(std::pin::pin!(ended), bound.as_mut()).await {
+        Either::Left((Ok(()), _)) => {}
+        Either::Left((Err(e), _)) => return Some(Err(e)),
+        Either::Right(_) => return None,
+    }
+    let drained = async {
+        let mut unread = [0; 4096];
+        while io.read(&mut unread).await? != 0 {}
+        Ok(())
+    };
+    // The bound first: an origin sending on and on would leave its timer no turn.
+    match future::select(bound, std::pin::pin!(drained)).await {
+        Either::Left(_) => None,
+        Either::Right((drained, _)) => Some(drained),
+    }
+}
+
+/// Whether `headers` list `option` in `Connection`.
+fn lists(headers: &http::HeaderMap, option: &str) -> bool {
+    headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|token| token.trim().eq_ignore_ascii_case(option))
+}
+
+/// Reads what the origin of the HTTP/1 connection over `io` still sends until it ends it,
+/// then counts it closed (`open`) as the origin did.
+async fn origin_end<T: AsyncRead + Connection + Unpin>(io: &mut T, mut open: Http1Open) {
+    use tokio::io::AsyncReadExt;
+
+    let mut unread = [0; 4096];
+    let read = loop {
+        match io.read(&mut unread).await {
+            Ok(0) => break Ok(()),
+            Ok(_) => {}
+            Err(e) => break Err(e),
+        }
+    };
+    open.ended(OriginEnd::of_read(&read, || io.close_notify_received()));
 }
 
 fn origin_form(uri: &mut Uri) {
@@ -1116,6 +1647,11 @@ fn normalize_uri<B>(req: &mut Request<B>, is_http_connect: bool) -> Result<Uri, 
         }
     }
 }
+
+/// A request extension for a request that names no `Host`, as an HTTP/1.0 one may: on an
+/// HTTP/1 connection it goes without one, rather than with one generated from its URI.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoHostOnHttp1;
 
 fn generate_host_header(uri: &Uri) -> HeaderValue {
     let hostname = uri.host().expect("authority implies host");
